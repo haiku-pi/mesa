@@ -588,6 +588,8 @@ struct pipe_resource
    uint32_t bind;            /**< bitmask of PIPE_BIND_x */
    uint32_t flags;           /**< bitmask of PIPE_RESOURCE_FLAG_x */
 
+   struct pipe_clientptr_heap *clientptr_heap;
+
    /**
     * For planar images, ie. YUV EGLImage external, etc, pointer to the
     * next plane.
@@ -1432,6 +1434,25 @@ struct pipe_vm_allocation
 {
    uint64_t start;
    uint64_t size;
+};
+
+/*
+ * Opaque object for resources with PIPE_RESOURCE_FLAG_MAP_CLIENT_POINTER
+ * which can share ranges.
+ */
+struct pipe_clientptr_heap
+{
+   struct pipe_reference reference;
+};
+
+/**
+ * A pointer range provided by the client, which resources with
+ * PIPE_RESOURCE_FLAG_MAP_CLIENT_POINTER can be mapped onto.
+ */
+struct pipe_clientptr_range
+{
+   uint8_t *start;
+   uint32_t size;
 };
 
 #ifdef __cplusplus
