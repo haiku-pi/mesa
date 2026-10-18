@@ -11,6 +11,7 @@
  */
 
 #include <fcntl.h>
+#include <stdio.h>
 #include <unistd.h>
 
 #include "pipe/p_screen.h"
@@ -53,6 +54,10 @@ haiku_create_hw_screen(void)
    /* The screen keeps its own duplicate of the descriptor. */
    struct pipe_screen *screen = v3d_drm_screen_create(fd, &config);
    close(fd);
+   if (screen == NULL) {
+      fprintf(stderr, "egl_haiku: no v3d screen on /dev/dri/renderD128, "
+         "using software rendering\n");
+   }
 
    driDestroyOptionCache(&options);
    driDestroyOptionInfo(&info);
