@@ -28,6 +28,7 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
+#include "util/detect_os.h"
 #include "util/perf/cpu_trace.h"
 #include "util/u_hash_table.h"
 #include "util/u_memory.h"
@@ -515,6 +516,13 @@ v3d_bo_map_unsynchronized(struct v3d_bo *bo)
                 abort();
         }
 
+#if DETECT_OS_HAIKU
+        /* Haiku cannot mmap() a device: MMAP_BO maps the BO into the calling
+         * team itself and returns the address of that mapping. munmap()
+         * removes it again (v3d_bo_free()).
+         */
+        bo->map = (void *)(uintptr_t)offset;
+#else
         bo->map = mmap(NULL, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED,
                        bo->screen->fd, offset);
         if (bo->map == MAP_FAILED) {
@@ -522,6 +530,7 @@ v3d_bo_map_unsynchronized(struct v3d_bo *bo)
                           bo->handle, (long long)offset, bo->size);
                 abort();
         }
+#endif
         VG(VALGRIND_MALLOCLIKE_BLOCK(bo->map, bo->size, 0, false));
 
         return bo->map;

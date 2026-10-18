@@ -25,6 +25,7 @@
 #include <err.h>
 
 #include "pipe/p_defines.h"
+#include "util/detect_os.h"
 #include "util/hash_table.h"
 #include "util/ralloc.h"
 #include "util/u_inlines.h"
@@ -69,7 +70,16 @@ v3d_pipe_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
                  */
                 drmSyncobjExportSyncFile(v3d->fd, v3d->out_sync, &fd);
                 if (fd == -1) {
+#if DETECT_OS_HAIKU
+                        /* Haiku's v3d driver has no sync files: wait for
+                         * the last job here, so that handing out no fence
+                         * (which the frontends take as signalled) is right.
+                         */
+                        drmSyncobjWait(v3d->fd, &v3d->out_sync, 1, INT64_MAX,
+                                       DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+#else
                         mesa_loge("Export failed");
+#endif
                         *fence = NULL;
                         return;
                 }
