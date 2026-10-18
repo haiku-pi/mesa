@@ -324,6 +324,10 @@ hgl_get_st_visual(struct st_visual* visual, ulong options)
 
 	assert(visual);
 
+	// callers pass an uninitialized struct: whatever is not set here (the
+	// sample count!) would be garbage
+	memset(visual, 0, sizeof(*visual));
+
 	// Determine color format
 	if ((options & HGL_INDEX) != 0) {
 		// Index color
