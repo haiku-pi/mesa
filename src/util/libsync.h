@@ -36,6 +36,9 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#ifdef __HAIKU__
+#include <sys/ioccom.h> /* _IOWR() */
+#endif
 #include <unistd.h>
 #include <stdlib.h>
 #include <time.h>
