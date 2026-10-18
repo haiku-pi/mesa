@@ -119,7 +119,13 @@ hgl_st_framebuffer_validate_textures(struct pipe_frontend_drawable *drawable,
 				case ST_ATTACHMENT_FRONT_RIGHT:
 				case ST_ATTACHMENT_BACK_RIGHT:
 					format = buffer->visual.color_format;
-					bind = PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_RENDER_TARGET;
+					// A hardware screen presents by reading the buffer back
+					// (no display target): let the driver choose its
+					// layout
+					if (buffer->screen->flush_frontbuffer == NULL)
+						bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
+					else
+						bind = PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_RENDER_TARGET;
 					break;
 				case ST_ATTACHMENT_DEPTH_STENCIL:
 					format = buffer->visual.depth_stencil_format;
