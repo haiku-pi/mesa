@@ -69,6 +69,11 @@ hgl_st_framebuffer_flush_front(struct st_context *st,
 		return true;
 
 	// TODO: pipe_context here??? Might be needed for hw renderers
+	// A hardware screen has no flush_frontbuffer: its frames reach the window
+	// on SwapBuffers (egl_haiku), front buffer rendering is not shown.
+	if (buffer->screen->flush_frontbuffer == NULL)
+		return true;
+
 	buffer->screen->flush_frontbuffer(buffer->screen, NULL, ptex, 0, 0,
 		buffer->winsysContext, 0, NULL);
 
@@ -262,7 +267,8 @@ hgl_destroy_st_framebuffer(struct hgl_buffer *buffer)
 
 
 struct hgl_context*
-hgl_create_context(struct hgl_display *display, struct st_visual* visual, struct st_context* shared)
+hgl_create_context(struct hgl_display *display, struct st_visual* visual,
+	struct st_context* shared, gl_api api, int major, int minor, unsigned flags)
 {
 	struct hgl_context* context = CALLOC_STRUCT(hgl_context);
 	assert(context);
@@ -271,10 +277,11 @@ hgl_create_context(struct hgl_display *display, struct st_visual* visual, struct
 	struct st_context_attribs attribs;
 	memset(&attribs, 0, sizeof(attribs));
 	attribs.options.force_glsl_extensions_warn = false;
-	attribs.profile = API_OPENGL_COMPAT;
+	attribs.profile = api;
 	attribs.visual = *visual;
-	attribs.major = 1;
-	attribs.minor = 0;
+	attribs.major = major;
+	attribs.minor = minor;
+	attribs.flags = flags;
 
 	enum st_context_error result;
 	context->st = st_api_create_context(display->fscreen, &attribs, &result, shared);

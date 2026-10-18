@@ -14,6 +14,7 @@
 #include "pipe/p_screen.h"
 
 #include "frontend/api.h"
+#include "main/menums.h"
 
 // visual options
 #define HGL_RGB			0
@@ -78,7 +79,8 @@ struct hgl_context
 struct hgl_buffer* hgl_create_st_framebuffer(struct hgl_display *display, struct st_visual* visual, void *winsysContext);
 void hgl_destroy_st_framebuffer(struct hgl_buffer *buffer);
 
-struct hgl_context* hgl_create_context(struct hgl_display *display, struct st_visual* visual, struct st_context* shared);
+struct hgl_context* hgl_create_context(struct hgl_display *display, struct st_visual* visual, struct st_context* shared,
+	gl_api api, int major, int minor, unsigned flags);
 void hgl_destroy_context(struct hgl_context* context);
 
 // hgl visual

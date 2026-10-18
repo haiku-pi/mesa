@@ -1916,11 +1916,15 @@ endif
 
 allow_fallback_for_libdrm = get_option('allow-fallback-for').contains('libdrm')
 
+# Haiku has no KMS, but its v3d kernel driver speaks the DRM render uAPI: the
+# v3d gallium driver uses libdrm there, without kmsro or the DRI loader.
+with_haiku_drm_render = host_machine.system() == 'haiku' and with_gallium_v3d
+
 with_gallium_drisw_kms = false
-if system_has_kms_drm
+if system_has_kms_drm or with_haiku_drm_render
   dep_libdrm = dependency(
     'libdrm', version : '>=' + _drm_ver,
-    required : with_dri2 or with_dri or with_gbm,
+    required : with_dri2 or with_dri or with_gbm or with_haiku_drm_render,
     allow_fallback: allow_fallback_for_libdrm,
     default_options : {
       'auto_features' : 'disabled',
