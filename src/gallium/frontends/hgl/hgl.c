@@ -220,6 +220,48 @@ hgl_st_manager_get_param(struct pipe_frontend_screen *fscreen, enum st_manager_p
 
 static uint32_t hgl_fb_ID = 0;
 
+
+/**
+ * The visual's depth/stencil format, as one the screen can render to: the
+ * visual asks for Z24_UNORM_S8_UINT, which not every driver supports (V3D
+ * renders S8_UINT_Z24_UNORM; given the other, its tile loads never finish).
+ */
+static void
+hgl_choose_depth_stencil_format(struct pipe_screen* screen,
+	struct st_visual* visual)
+{
+	static const enum pipe_format kDepthStencil[] = {
+		PIPE_FORMAT_Z24_UNORM_S8_UINT,
+		PIPE_FORMAT_S8_UINT_Z24_UNORM,
+		PIPE_FORMAT_Z32_FLOAT_S8X24_UINT,
+	};
+	static const enum pipe_format kDepth[] = {
+		PIPE_FORMAT_Z24X8_UNORM,
+		PIPE_FORMAT_X8Z24_UNORM,
+		PIPE_FORMAT_Z32_FLOAT,
+		PIPE_FORMAT_Z16_UNORM,
+	};
+
+	const enum pipe_format requested = visual->depth_stencil_format;
+	if (requested == PIPE_FORMAT_NONE
+		|| screen->is_format_supported(screen, requested, PIPE_TEXTURE_2D, 0, 0,
+			PIPE_BIND_DEPTH_STENCIL)) {
+		return;
+	}
+
+	const bool stencil = util_format_has_stencil(util_format_description(requested));
+	const enum pipe_format* formats = stencil ? kDepthStencil : kDepth;
+	const unsigned count = stencil ? ARRAY_SIZE(kDepthStencil) : ARRAY_SIZE(kDepth);
+	for (unsigned i = 0; i < count; i++) {
+		if (screen->is_format_supported(screen, formats[i], PIPE_TEXTURE_2D, 0, 0,
+				PIPE_BIND_DEPTH_STENCIL)) {
+			visual->depth_stencil_format = formats[i];
+			return;
+		}
+	}
+	visual->depth_stencil_format = PIPE_FORMAT_NONE;
+}
+
 /**
  * Create new framebuffer
  */
@@ -239,6 +281,7 @@ hgl_create_st_framebuffer(struct hgl_display *display, struct st_visual* visual,
 	// Prepare our buffer
 	buffer->visual = *visual;
 	buffer->screen = display->fscreen->screen;
+	hgl_choose_depth_stencil_format(buffer->screen, &buffer->visual);
 	buffer->winsysContext = winsysContext;
 
 	if (buffer->screen->caps.npot_textures)
@@ -285,6 +328,7 @@ hgl_create_context(struct hgl_display *display, struct st_visual* visual,
 	attribs.options.force_glsl_extensions_warn = false;
 	attribs.profile = api;
 	attribs.visual = *visual;
+	hgl_choose_depth_stencil_format(display->fscreen->screen, &attribs.visual);
 	attribs.major = major;
 	attribs.minor = minor;
 	attribs.flags = flags;
