@@ -27,6 +27,7 @@
 #include <errno.h>
 #include <sys/mman.h>
 
+#include "util/detect_os.h"
 #include "util/perf/cpu_trace.h"
 #include "util/u_memory.h"
 
@@ -295,6 +296,14 @@ v3dv_bo_map_unsynchronized(struct v3dv_device *device,
       return false;
    }
 
+#if DETECT_OS_HAIKU
+   /* Haiku cannot mmap() a device: MMAP_BO maps the whole BO into the
+    * calling team itself and returns the address of that mapping, which
+    * munmap() removes again (v3dv_bo_unmap()).
+    */
+   bo->map = (void *)(uintptr_t)map.offset;
+   size = bo->size;
+#else
    bo->map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
                   device->pdevice->render_fd, map.offset);
    if (bo->map == MAP_FAILED) {
@@ -302,6 +311,7 @@ v3dv_bo_map_unsynchronized(struct v3dv_device *device,
                 bo->handle, (long long)map.offset, (uint32_t)bo->size);
       return false;
    }
+#endif
    VG(VALGRIND_MALLOCLIKE_BLOCK(bo->map, bo->size, 0, false));
 
    bo->map_size = size;
@@ -394,6 +404,9 @@ reallocate_size_list(struct v3dv_bo_cache *cache,
 void
 v3dv_bo_cache_init(struct v3dv_device *device)
 {
+   /* A zero-filled mtx_t is only an unlocked mutex on some platforms */
+   mtx_init(&device->bo_cache.lock, mtx_plain);
+
    device->bo_size = 0;
    device->bo_count = 0;
    list_inithead(&device->bo_cache.time_list);
@@ -429,6 +442,7 @@ v3dv_bo_cache_destroy(struct v3dv_device *device)
       mesa_loge("BO stats after screen destroy:\n");
       bo_dump_stats(device);
    }
+   mtx_destroy(&device->bo_cache.lock);
 }
 
 

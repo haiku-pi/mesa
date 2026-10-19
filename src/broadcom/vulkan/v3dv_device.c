@@ -37,6 +37,13 @@
 #include <sys/sysmacros.h>
 #endif
 
+#include "util/detect_os.h"
+#if DETECT_OS_HAIKU
+/* Haiku's devfs has no device numbers: VK_EXT_physical_device_drm reports 0 */
+#define major(dev) ((void)(dev), 0)
+#define minor(dev) ((void)(dev), 0)
+#endif
+
 #include "v3dv_device.h"
 #include "v3dv_cmd_buffer.h"
 #include "v3dv_image.h"
@@ -864,6 +871,7 @@ device_has_expected_features(struct v3dv_physical_device *device)
 static VkResult
 init_uuids(struct v3dv_physical_device *device)
 {
+#if HAVE_BUILD_ID
    const struct build_id_note *note =
       build_id_find_nhdr_for_addr(init_uuids);
    if (!note) {
@@ -879,7 +887,28 @@ init_uuids(struct v3dv_physical_device *device)
                        "build-id too short.  It needs to be a SHA");
    }
 
+   const void *build_id = build_id_data(note);
    copy_build_id_to_sha1(device->driver_build_sha1, note);
+#else
+   /* No build-id to be read (no dl_iterate_phdr(), e.g. on Haiku): identify
+    * the driver build by its library file instead.
+    */
+   blake3_hasher id_ctx;
+   uint8_t id_hash[BLAKE3_KEY_LEN];
+   _mesa_blake3_init(&id_ctx);
+   if (!disk_cache_get_function_identifier(init_uuids, &id_ctx)) {
+      return vk_errorf(device->vk.instance,
+                       VK_ERROR_INITIALIZATION_FAILED,
+                       "Failed to identify the driver build");
+   }
+   _mesa_blake3_final(&id_ctx, id_hash);
+
+   const void *build_id = id_hash;
+   unsigned build_id_len = sizeof(id_hash);
+   STATIC_ASSERT(sizeof(device->driver_build_sha1) <= sizeof(id_hash));
+   memcpy(device->driver_build_sha1, id_hash,
+          sizeof(device->driver_build_sha1));
+#endif
 
    uint32_t vendor_id = v3dv_physical_device_vendor_id(device);
    uint32_t device_id = v3dv_physical_device_device_id(device);
@@ -892,7 +921,7 @@ init_uuids(struct v3dv_physical_device *device)
     * invalid.  It needs both a driver build and the PCI ID of the device.
     */
    _mesa_blake3_init(&blake3_ctx);
-   _mesa_blake3_update(&blake3_ctx, build_id_data(note), build_id_len);
+   _mesa_blake3_update(&blake3_ctx, build_id, build_id_len);
    _mesa_blake3_update(&blake3_ctx, &device_id, sizeof(device_id));
    _mesa_blake3_final(&blake3_ctx, blake3);
    memcpy(device->pipeline_cache_uuid, blake3, VK_UUID_SIZE);
@@ -902,7 +931,7 @@ init_uuids(struct v3dv_physical_device *device)
     * share memory need to also check the device UUID (below) so all this
     * needs to be is the build-id.
     */
-   memcpy(device->driver_uuid, build_id_data(note), VK_UUID_SIZE);
+   memcpy(device->driver_uuid, build_id, VK_UUID_SIZE);
 
    /* The device UUID uniquely identifies the given device within the machine.
     * Since we never have more than one device, this doesn't need to be a real
@@ -985,10 +1014,17 @@ get_device_properties(const struct v3dv_physical_device *device,
 
    const uint8_t max_rts = device->devinfo.max_render_targets;
 
+   /* The kernel's timestamp queries write nanoseconds (ktime_get_ns()),
+    * whatever resolution CLOCK_MONOTONIC reports (1 us on Haiku).
+    */
+#if DETECT_OS_HAIKU
+   const float timestamp_period = 1.0f;
+#else
    struct timespec clock_res;
    clock_getres(CLOCK_MONOTONIC, &clock_res);
    const float timestamp_period =
       clock_res.tv_sec * 1000000000.0f + clock_res.tv_nsec;
+#endif
 
    /* We don't really have special restrictions for the maximum
     * descriptors per set, other than maybe not exceeding the limits
@@ -1427,7 +1463,9 @@ create_physical_device(struct v3dv_instance *instance,
       goto fail;
 
    struct stat primary_stat = {0}, render_stat = {0};
-   if (fstat(primary_fd, &primary_stat) != 0) {
+   if (primary_fd < 0) {
+      /* Only a render node (Haiku) */
+   } else if (fstat(primary_fd, &primary_stat) != 0) {
       result = vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
                          "failed to stat DRM primary node");
    } else {
@@ -1684,6 +1722,16 @@ enumerate_devices(struct vk_instance *vk_instance)
 {
    struct v3dv_instance *instance =
       container_of(vk_instance, struct v3dv_instance, vk);
+
+#if DETECT_OS_HAIKU
+   /* Haiku has no DRM device enumeration and no KMS: its v3d kernel driver
+    * publishes the render node only.
+    */
+   int32_t haiku_render_fd = -1;
+   if (!try_device("/dev/dri/renderD128", &haiku_render_fd, "v3d"))
+      return VK_SUCCESS;
+   return create_physical_device(instance, -1, haiku_render_fd, -1);
+#endif
 
    /* FIXME: Check for more devices? */
    drmDevicePtr devices[8];

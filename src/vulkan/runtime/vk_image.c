@@ -23,7 +23,7 @@
 
 #include "vk_image.h"
 
-#if DETECT_OS_LINUX || DETECT_OS_BSD
+#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_HAIKU
 #include <drm-uapi/drm_fourcc.h>
 #endif
 
@@ -105,7 +105,7 @@ vk_image_init(struct vk_device *device,
       vk_find_struct_const(pCreateInfo->pNext, WSI_IMAGE_CREATE_INFO_MESA);
    image->wsi_legacy_scanout = wsi_info && wsi_info->scanout;
 
-#if DETECT_OS_LINUX || DETECT_OS_BSD
+#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_HAIKU
    image->drm_format_mod = ((1ULL << 56) - 1) /* DRM_FORMAT_MOD_INVALID */;
 #endif
 
@@ -185,7 +185,7 @@ vk_image_destroy(struct vk_device *device,
    vk_object_free(device, alloc, image);
 }
 
-#if DETECT_OS_LINUX || DETECT_OS_BSD
+#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_HAIKU
 VKAPI_ATTR VkResult VKAPI_CALL
 vk_common_GetImageDrmFormatModifierPropertiesEXT(UNUSED VkDevice device,
                                                  VkImage _image,
