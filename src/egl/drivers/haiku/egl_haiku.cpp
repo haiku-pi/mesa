@@ -103,6 +103,9 @@ struct haiku_egl_surface {
    struct imported_bitmap imported[2];
       // the two bitmaps that alternate on screen
    bool no_import; // the driver cannot import them: copy
+   // HAIKU_EGL_FPS: frames presented since fps_start (us), printed every 5 s
+   uint32_t fps_frames;
+   bigtime_t fps_start;
 };
 
 static void release_import(struct haiku_egl_surface *surface, BBitmap *bitmap);
@@ -399,6 +402,20 @@ haiku_swap_buffers(_EGLDisplay *disp, _EGLSurface *surf)
    }
 
    // XXX: right front / back if HGL_STEREO?
+
+   static const bool reportRate = getenv("HAIKU_EGL_FPS") != NULL;
+   if (reportRate) {
+      const bigtime_t now = system_time();
+      if (hgl_surf->fps_start == 0)
+         hgl_surf->fps_start = now;
+      hgl_surf->fps_frames++;
+      if (now - hgl_surf->fps_start >= 5000000) {
+         fprintf(stderr, "egl_haiku: %.1f frames/s\n",
+                 hgl_surf->fps_frames * 1e6 / (now - hgl_surf->fps_start));
+         hgl_surf->fps_frames = 0;
+         hgl_surf->fps_start = now;
+      }
+   }
 
    update_size(buffer);
 
