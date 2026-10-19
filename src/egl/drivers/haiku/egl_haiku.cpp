@@ -103,6 +103,18 @@ struct haiku_egl_surface {
    struct imported_bitmap imported[2];
       // the two bitmaps that alternate on screen
    bool no_import; // the driver cannot import them: copy
+   // The presenter thread (imported bitmaps): it waits for the GPU's blit of a
+   // swap and hands the bitmap to the view, while the client renders the next
+   // frame. The render thread waits for it (presented_sem) only at the next
+   // swap, before it takes spare_bitmap again.
+   thread_id presenter; // 0: not started yet, < 0: none (hand over in place)
+   sem_id present_sem;
+   sem_id presented_sem;
+   bool presenting; // a frame is with the presenter (render thread only)
+   bool quit;
+   struct pipe_screen *present_screen;
+   BBitmap *pending_bitmap;
+   struct imported_bitmap *pending_slot;
    // HAIKU_EGL_FPS: frames presented since fps_start (us), printed every 5 s
    uint32_t fps_frames;
    bigtime_t fps_start;
@@ -198,6 +210,17 @@ haiku_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
       struct pipe_screen *screen = hgl_dpy->disp->fscreen->screen;
       screen->fence_reference(screen, &hgl_surf->throttle_fence, NULL);
 
+      if (hgl_surf->presenter > 0) {
+         if (hgl_surf->presenting)
+            acquire_sem(hgl_surf->presented_sem);
+         hgl_surf->quit = true;
+         release_sem(hgl_surf->present_sem);
+         status_t result;
+         wait_for_thread(hgl_surf->presenter, &result);
+         delete_sem(hgl_surf->present_sem);
+         delete_sem(hgl_surf->presented_sem);
+      }
+
       // Unset bitmap to release ownership. Bitmap will be deleted later
       // when destroying framebuffer.
       BitmapHook *bitmapHook = (BitmapHook*)hgl_surf->fb->winsysContext;
@@ -248,15 +271,15 @@ release_import(struct haiku_egl_surface *surface, BBitmap *bitmap)
  * once: no CPU copy, no read of the GPU's write-combining memory. Returns
  * false when the bitmap cannot be imported (then the CPU copies).
  */
-static bool
+static struct imported_bitmap *
 haiku_present_gpu(struct pipe_context *pipe, struct pipe_resource *resource,
                   struct haiku_egl_surface *surface, BBitmap *bitmap)
 {
    if (surface->no_import)
-      return false;
+      return NULL;
    static const bool disabled = getenv("HAIKU_EGL_NO_IMPORT") != NULL;
    if (disabled)
-      return false;
+      return NULL;
 
    struct pipe_screen *screen = pipe->screen;
    struct imported_bitmap *slot = NULL;
@@ -273,7 +296,7 @@ haiku_present_gpu(struct pipe_context *pipe, struct pipe_resource *resource,
       if (slot->resource == NULL) {
          ERROR("cannot import the window's bitmap: presenting by copying\n");
          surface->no_import = true;
-         return false;
+         return NULL;
       }
       slot->bitmap = bitmap;
    }
@@ -293,13 +316,29 @@ haiku_present_gpu(struct pipe_context *pipe, struct pipe_resource *resource,
    blit.filter = PIPE_TEX_FILTER_NEAREST;
    pipe->blit(pipe, &blit);
 
-   // the bitmap is the job's own buffer: wait for it, no fence needed
+   // the presenter waits for it (the bitmap is the job's own buffer: no fence)
    pipe->flush(pipe, NULL, 0);
-   haiku_hw_wait_memory(screen, slot->handle);
+   return slot;
+}
 
-   // and nothing stale may be read: the app_server reads it next
-   haiku_hw_sync_memory(screen, slot->handle);
-   return true;
+
+/*
+ * The presenter thread: hands each blitted bitmap to the view once the GPU is
+ * done with it, after dropping the CPU's stale cache lines (app_server reads
+ * it next).
+ */
+static status_t
+haiku_presenter(void *data)
+{
+   struct haiku_egl_surface *surface = (struct haiku_egl_surface *)data;
+   BitmapHook *hook = (BitmapHook *)surface->fb->winsysContext;
+   while (acquire_sem(surface->present_sem) == B_OK && !surface->quit) {
+      haiku_hw_wait_memory(surface->present_screen, surface->pending_slot->handle);
+      haiku_hw_sync_memory(surface->present_screen, surface->pending_slot->handle);
+      surface->spare_bitmap = hook->SetBitmap(surface->pending_bitmap);
+      release_sem(surface->presented_sem);
+   }
+   return B_OK;
 }
 
 /*
@@ -314,6 +353,12 @@ haiku_present_copy(struct pipe_context *pipe, struct pipe_resource *resource,
    BitmapHook *hook = (BitmapHook *)surface->fb->winsysContext;
    if (hook == NULL)
       return; // a pbuffer
+
+   // the previous frame's bitmap is on screen and the one before is spare again
+   if (surface->presenting) {
+      acquire_sem(surface->presented_sem);
+      surface->presenting = false;
+   }
 
    const unsigned width = resource->width0;
    const unsigned height = resource->height0;
@@ -331,8 +376,35 @@ haiku_present_copy(struct pipe_context *pipe, struct pipe_resource *resource,
       }
    }
 
-   if (haiku_present_gpu(pipe, resource, surface, bitmap)) {
+   struct imported_bitmap *slot = haiku_present_gpu(pipe, resource, surface,
+                                                    bitmap);
+   if (slot != NULL && surface->presenter == 0) {
+      surface->present_sem = create_sem(0, "egl present");
+      surface->presented_sem = create_sem(0, "egl presented");
+      surface->present_screen = pipe->screen;
+      surface->presenter = spawn_thread(haiku_presenter, "egl presenter",
+                                        B_DISPLAY_PRIORITY, surface);
+      if (surface->present_sem < 0 || surface->presented_sem < 0
+          || surface->presenter < 0 || resume_thread(surface->presenter) != B_OK) {
+         if (surface->presenter > 0)
+            kill_thread(surface->presenter);
+         delete_sem(surface->present_sem);
+         delete_sem(surface->presented_sem);
+         surface->presenter = -1;
+      }
+   }
+   if (slot != NULL && surface->presenter < 0) {
+      // no presenter: hand the bitmap over here
+      haiku_hw_wait_memory(pipe->screen, slot->handle);
+      haiku_hw_sync_memory(pipe->screen, slot->handle);
       surface->spare_bitmap = hook->SetBitmap(bitmap);
+      return;
+   }
+   if (slot != NULL) {
+      surface->pending_bitmap = bitmap;
+      surface->pending_slot = slot;
+      surface->presenting = true;
+      release_sem(surface->present_sem);
       return;
    }
 
