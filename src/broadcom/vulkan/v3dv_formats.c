@@ -817,6 +817,16 @@ v3dv_GetPhysicalDeviceExternalBufferProperties(
       vk_android_get_ahb_buffer_properties(
          physicalDevice, pExternalBufferInfo, pExternalBufferProperties);
       return;
+#if DETECT_OS_HAIKU
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT:
+      pExternalBufferProperties->externalMemoryProperties =
+         (VkExternalMemoryProperties) {
+            .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+            .compatibleHandleTypes =
+               VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+         };
+      return;
+#endif
    default: /* Unsupported */
       pExternalBufferProperties->externalMemoryProperties =
          (VkExternalMemoryProperties) {

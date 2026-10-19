@@ -603,6 +603,13 @@ VkResult wsi_CreateHeadlessSurfaceEXT(
    VK_FROM_HANDLE(vk_instance, instance, _instance);
    VkIcdSurfaceHeadless *surface;
 
+#ifdef VK_USE_PLATFORM_HAIKU_MESA
+   if (wsi_haiku_is_view_surface(pCreateInfo)) {
+      return wsi_haiku_create_surface(_instance, pCreateInfo, pAllocator,
+                                      pSurface);
+   }
+#endif
+
    surface = vk_alloc2(&instance->alloc, pAllocator, sizeof *surface, 8,
                        VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (surface == NULL)

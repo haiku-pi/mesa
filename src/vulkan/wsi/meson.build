@@ -38,6 +38,14 @@ if with_platform_macos
   files_vulkan_wsi += files('wsi_common_metal.c', 'wsi_common_metal_layer.m')
 endif
 
+if with_platform_haiku
+  files_vulkan_wsi += files('wsi_common_haiku.cpp')
+  platform_deps += cpp.find_library('be')
+  # the application's side of Haiku view surfaces, next to the Vulkan headers
+  install_headers('vk_haiku_surface.h',
+                  install_dir : get_option('prefix') / 'develop/headers/vulkan')
+endif
+
 if system_has_kms_drm and not with_platform_android
   files_vulkan_wsi += files('wsi_common_display.c')
 endif

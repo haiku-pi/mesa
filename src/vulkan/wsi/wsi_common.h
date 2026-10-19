@@ -52,7 +52,11 @@ struct vk_queue;
 
 struct driOptionCache;
 
-#define VK_ICD_WSI_PLATFORM_MAX (VK_ICD_WSI_PLATFORM_METAL + 1)
+/* Haiku view surfaces (vk_haiku_surface.h): Mesa's own platform, vk_icd.h has
+ * none. The value stays clear of the platforms vk_icd.h may add. */
+#define VK_ICD_WSI_PLATFORM_HAIKU_MESA ((VkIcdWsiPlatform)32)
+
+#define VK_ICD_WSI_PLATFORM_MAX (VK_ICD_WSI_PLATFORM_HAIKU_MESA + 1)
 
 struct wsi_device {
    /* Allocator for the instance */
@@ -224,6 +228,7 @@ struct wsi_device {
    WSI_CB(DestroyQueryPool);
    WSI_CB(DestroySemaphore);
    WSI_CB(EndCommandBuffer);
+   WSI_CB(FlushMappedMemoryRanges);
    WSI_CB(FreeMemory);
    WSI_CB(FreeCommandBuffers);
    WSI_CB(GetBufferMemoryRequirements);
@@ -241,6 +246,7 @@ struct wsi_device {
    WSI_CB(GetPhysicalDeviceQueueFamilyProperties);
    WSI_CB(GetQueryPoolResults);
    WSI_CB(GetSemaphoreFdKHR);
+   WSI_CB(InvalidateMappedMemoryRanges);
    WSI_CB(ResetFences);
    WSI_CB(QueueSubmit2);
    WSI_CB(SetDebugUtilsObjectNameEXT);

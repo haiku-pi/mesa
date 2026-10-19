@@ -582,6 +582,24 @@ VkResult wsi_headless_init_wsi(struct wsi_device *wsi_device,
 void wsi_headless_finish_wsi(struct wsi_device *wsi_device,
                              const VkAllocationCallbacks *alloc);
 
+#ifdef VK_USE_PLATFORM_HAIKU_MESA
+VkResult wsi_haiku_init_wsi(struct wsi_device *wsi_device,
+                            const VkAllocationCallbacks *alloc,
+                            VkPhysicalDevice physical_device);
+void wsi_haiku_finish_wsi(struct wsi_device *wsi_device,
+                          const VkAllocationCallbacks *alloc);
+
+/* A headless surface create info with a VkHaikuSurfaceCreateInfoMESA in its
+ * chain (vk_haiku_surface.h) makes a Haiku view surface. */
+VkResult wsi_haiku_create_surface(VkInstance instance,
+                                  const VkHeadlessSurfaceCreateInfoEXT *info,
+                                  const VkAllocationCallbacks *pAllocator,
+                                  VkSurfaceKHR *pSurface);
+bool wsi_haiku_is_view_surface(const VkHeadlessSurfaceCreateInfoEXT *info);
+void wsi_haiku_surface_destroy(VkIcdSurfaceBase *surface, VkInstance instance,
+                               const VkAllocationCallbacks *pAllocator);
+#endif
+
 VK_DEFINE_NONDISP_HANDLE_CASTS(wsi_swapchain, base, VkSwapchainKHR,
                                VK_OBJECT_TYPE_SWAPCHAIN_KHR)
 

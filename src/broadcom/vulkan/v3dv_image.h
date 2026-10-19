@@ -218,6 +218,8 @@ struct v3dv_buffer {
    VkDeviceSize size;
    VkBufferUsageFlagBits2KHR usage;
    uint32_t alignment;
+   /* may be bound to imported host memory (VK_EXT_external_memory_host) */
+   bool host_memory;
 
    struct v3dv_device_memory *mem;
    VkDeviceSize mem_offset;

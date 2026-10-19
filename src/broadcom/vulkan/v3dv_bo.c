@@ -203,6 +203,7 @@ v3dv_bo_init(struct v3dv_bo *bo,
    bo->private = private;
    bo->dumb_handle = -1;
    bo->is_import = false;
+   bo->host_ptr = NULL;
    bo->cl_branch_offset = 0xffffffff;
    list_inithead(&bo->list_link);
 }
@@ -286,6 +287,12 @@ v3dv_bo_map_unsynchronized(struct v3dv_device *device,
    if (bo->map)
       return bo->map;
 
+   if (bo->host_ptr) {
+      bo->map = bo->host_ptr;
+      bo->map_size = bo->size;
+      return true;
+   }
+
    struct drm_v3d_mmap_bo map;
    memset(&map, 0, sizeof(map));
    map.handle = bo->handle;
@@ -356,8 +363,10 @@ v3dv_bo_unmap(struct v3dv_device *device, struct v3dv_bo *bo)
 {
    assert(bo && bo->map && bo->map_size > 0);
 
-   munmap(bo->map, bo->map_size);
-   VG(VALGRIND_FREELIKE_BLOCK(bo->map, 0));
+   if (bo->host_ptr == NULL) {
+      munmap(bo->map, bo->map_size);
+      VG(VALGRIND_FREELIKE_BLOCK(bo->map, 0));
+   }
    bo->map = NULL;
    bo->map_size = 0;
 }

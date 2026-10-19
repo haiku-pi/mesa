@@ -66,6 +66,12 @@ struct v3dv_bo {
    bool is_import;
 
    /**
+    * Host memory that the BO is (VK_EXT_external_memory_host, Haiku): its
+    * mapping, which stays.
+    */
+   void *host_ptr;
+
+   /**
     * If this BO was allocated for a swapchain on the display device, the
     * handle of the dumb BO on that device.
     */

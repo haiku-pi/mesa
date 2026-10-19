@@ -23,6 +23,7 @@
 #ifndef V3DV_DEVICE_H
 #define V3DV_DEVICE_H
 
+#include "util/detect_os.h"
 #include "v3dv_common.h"
 #include "v3dv_bo.h"
 #include "v3dv_limits.h"
@@ -125,6 +126,11 @@ v3dv_device_lookup_bo(struct v3dv_physical_device *device, uint32_t handle)
 {
    return (struct v3dv_bo *) util_sparse_array_get(&device->bo_map, handle);
 }
+
+#if DETECT_OS_HAIKU
+/* The memory type of imported host memory (VK_EXT_external_memory_host) */
+#define V3DV_HOST_IMPORT_MEMORY_TYPE 1
+#endif
 
 VkResult v3dv_wsi_init(struct v3dv_physical_device *physical_device);
 void v3dv_wsi_finish(struct v3dv_physical_device *physical_device);

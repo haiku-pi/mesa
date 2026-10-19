@@ -211,6 +211,7 @@ wsi_device_init(struct wsi_device *wsi,
    WSI_GET_CB(DestroyQueryPool);
    WSI_GET_CB(DestroySemaphore);
    WSI_GET_CB(EndCommandBuffer);
+   WSI_GET_CB(FlushMappedMemoryRanges);
    WSI_GET_CB(FreeMemory);
    WSI_GET_CB(FreeCommandBuffers);
    WSI_GET_CB(GetBufferMemoryRequirements);
@@ -229,6 +230,7 @@ wsi_device_init(struct wsi_device *wsi,
    WSI_GET_CB(GetCalibratedTimestampsKHR);
    WSI_GET_CB(GetQueryPoolResults);
    WSI_GET_CB(GetSemaphoreFdKHR);
+   WSI_GET_CB(InvalidateMappedMemoryRanges);
    WSI_GET_CB(ResetFences);
    WSI_GET_CB(QueueSubmit2);
    WSI_GET_CB(SetDebugUtilsObjectNameEXT);
@@ -265,6 +267,12 @@ wsi_device_init(struct wsi_device *wsi,
 
 #ifdef VK_USE_PLATFORM_METAL_EXT
    result = wsi_metal_init_wsi(wsi, alloc, pdevice);
+   if (result != VK_SUCCESS)
+      goto fail;
+#endif
+
+#ifdef VK_USE_PLATFORM_HAIKU_MESA
+   result = wsi_haiku_init_wsi(wsi, alloc, pdevice);
    if (result != VK_SUCCESS)
       goto fail;
 #endif
@@ -358,6 +366,9 @@ wsi_device_finish(struct wsi_device *wsi,
 #if defined(VK_USE_PLATFORM_METAL_EXT)
    wsi_metal_finish_wsi(wsi, alloc);
 #endif
+#ifdef VK_USE_PLATFORM_HAIKU_MESA
+   wsi_haiku_finish_wsi(wsi, alloc);
+#endif
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -380,6 +391,12 @@ wsi_DestroySurfaceKHR(VkInstance _instance,
 #ifdef VK_USE_PLATFORM_WIN32_KHR
    if (surface->platform == VK_ICD_WSI_PLATFORM_WIN32) {
       wsi_win32_surface_destroy(surface, _instance, pAllocator);
+      return;
+   }
+#endif
+#ifdef VK_USE_PLATFORM_HAIKU_MESA
+   if (surface->platform == VK_ICD_WSI_PLATFORM_HAIKU_MESA) {
+      wsi_haiku_surface_destroy(surface, _instance, pAllocator);
       return;
    }
 #endif

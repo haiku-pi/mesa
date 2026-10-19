@@ -42,6 +42,27 @@
 /* Haiku's devfs has no device numbers: VK_EXT_physical_device_drm reports 0 */
 #define major(dev) ((void)(dev), 0)
 #define minor(dev) ((void)(dev), 0)
+
+/* Haiku extensions of the v3d kernel driver (Haiku's
+ * headers/private/drivers/drm/v3d_drm.h): host memory as a BO, and the CPU
+ * cache maintenance it needs (the GPU does not snoop the CPU's caches).
+ */
+struct haiku_v3d_import_memory {
+   uint64_t address;
+   uint64_t size;
+   uint32_t handle;
+   uint32_t offset;
+};
+
+struct haiku_v3d_sync_bo {
+   uint32_t handle;
+   uint32_t pad;
+};
+
+#define HAIKU_V3D_IOCTL_IMPORT_MEMORY \
+   DRM_IOWR(DRM_COMMAND_BASE + 0x30, struct haiku_v3d_import_memory)
+#define HAIKU_V3D_IOCTL_SYNC_BO \
+   DRM_IOWR(DRM_COMMAND_BASE + 0x31, struct haiku_v3d_sync_bo)
 #endif
 
 #include "v3dv_device.h"
@@ -111,7 +132,8 @@ v3dv_EnumerateInstanceVersion(uint32_t *pApiVersion)
     defined(VK_USE_PLATFORM_WAYLAND_KHR) || \
     defined(VK_USE_PLATFORM_XCB_KHR) ||     \
     defined(VK_USE_PLATFORM_XLIB_KHR) ||    \
-    defined(VK_USE_PLATFORM_DISPLAY_KHR)
+    defined(VK_USE_PLATFORM_DISPLAY_KHR) || \
+    defined(VK_USE_PLATFORM_HAIKU_MESA)
 #define V3DV_USE_WSI_PLATFORM
 #include "wsi_common.h"
 #endif
@@ -259,6 +281,9 @@ get_device_extensions(const struct v3dv_physical_device *device,
       .EXT_extended_dynamic_state           = true,
       .EXT_extended_dynamic_state2          = true,
       .EXT_external_memory_dma_buf          = true,
+#if DETECT_OS_HAIKU
+      .EXT_external_memory_host             = true,
+#endif
 #ifdef V3DV_USE_WSI_PLATFORM
       .EXT_hdr_metadata                     = true,
 #endif
@@ -1400,6 +1425,11 @@ get_device_properties(const struct v3dv_physical_device *device,
       .maxComputeWorkgroupSubgroups = V3D_MAX_CSD_WG_SIZE / V3D_CHANNELS,
       .requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT,
 
+#if DETECT_OS_HAIKU
+      /* VK_EXT_external_memory_host */
+      .minImportedHostPointerAlignment = 4096,
+#endif
+
       /* VK_KHR_maintenance5 */
       .earlyFragmentMultisampleCoverageAfterSampleCounting = true,
       .earlyFragmentSampleMaskTestBeforeSampleCounting = true,
@@ -1557,6 +1587,20 @@ create_physical_device(struct v3dv_instance *instance,
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
    mem->memoryTypes[0].heapIndex = 0;
+
+#if DETECT_OS_HAIKU
+   /* Imported host memory (VK_EXT_external_memory_host): cached for the
+    * CPU, not coherent with the GPU (Flush/InvalidateMappedMemoryRanges
+    * maintain the CPU's caches). Only buffers that may import host memory
+    * offer it.
+    */
+   mem->memoryTypeCount = 2;
+   mem->memoryTypes[V3DV_HOST_IMPORT_MEMORY_TYPE].propertyFlags =
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+      VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+   mem->memoryTypes[V3DV_HOST_IMPORT_MEMORY_TYPE].heapIndex = 0;
+#endif
 
    /* Initialize sparse array for refcounting imported BOs */
    util_sparse_array_init(&device->bo_map, sizeof(struct v3dv_bo), 512);
@@ -2335,6 +2379,35 @@ device_import_bo(struct v3dv_device *device,
    return VK_SUCCESS;
 }
 
+#if DETECT_OS_HAIKU
+/* Host memory (VK_EXT_external_memory_host) as a BO: the kernel wires its
+ * pages and maps them for the GPU. The application keeps the memory while
+ * the BO lives; it stays mapped where it is.
+ */
+static VkResult
+device_import_host_memory(struct v3dv_device *device,
+                          struct v3dv_device_memory *mem,
+                          VkDeviceSize size)
+{
+   struct haiku_v3d_import_memory import = {
+      .address = (uintptr_t)mem->vk.host_ptr,
+      .size = size,
+   };
+   if ((import.address & 4095) != 0 ||
+       v3d_ioctl(device->pdevice->render_fd, HAIKU_V3D_IOCTL_IMPORT_MEMORY,
+                 &import) != 0) {
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   struct v3dv_bo *bo = v3dv_device_lookup_bo(device->pdevice, import.handle);
+   assert(bo != NULL && bo->refcnt == 0);
+   v3dv_bo_init_import(bo, import.handle, size, import.offset, false);
+   bo->host_ptr = mem->vk.host_ptr;
+   mem->bo = bo;
+   return VK_SUCCESS;
+}
+#endif
+
 static VkResult
 device_alloc_for_wsi(struct v3dv_device *device,
                      const VkAllocationCallbacks *pAllocator,
@@ -2499,6 +2572,7 @@ v3dv_AllocateMemory(VkDevice _device,
           */
          break;
       case VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID:
+      case VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT:
          /* This case is handled in the common code */
          break;
       default:
@@ -2509,6 +2583,14 @@ v3dv_AllocateMemory(VkDevice _device,
 
    VkResult result;
 
+#if DETECT_OS_HAIKU
+   if (mem->vk.host_ptr != NULL) {
+      result = device_import_host_memory(device, mem, alloc_size);
+   } else if (wsi_info && pdevice->display_fd == -1) {
+      /* No display device (Haiku's WSI copies its images to the screen) */
+      result = device_alloc(device, mem, alloc_size);
+   } else
+#endif
    if (wsi_info) {
       result = device_alloc_for_wsi(device, pAllocator, mem, alloc_size);
    } else if (fd_info && fd_info->handleType) {
@@ -2605,11 +2687,36 @@ v3dv_UnmapMemory(VkDevice _device,
    device_unmap(device, mem);
 }
 
+/* Writes back and drops the CPU's cache lines of imported host memory (all
+ * other memory is write-combined: coherent).
+ */
+static void
+sync_mapped_memory_ranges(struct v3dv_device *device,
+                          uint32_t memoryRangeCount,
+                          const VkMappedMemoryRange *pMemoryRanges)
+{
+#if DETECT_OS_HAIKU
+   for (uint32_t i = 0; i < memoryRangeCount; i++) {
+      V3DV_FROM_HANDLE(v3dv_device_memory, mem, pMemoryRanges[i].memory);
+      if (mem->bo->host_ptr == NULL)
+         continue;
+      struct haiku_v3d_sync_bo sync = { .handle = mem->bo->handle };
+      if (v3d_ioctl(device->pdevice->render_fd, HAIKU_V3D_IOCTL_SYNC_BO,
+                    &sync) != 0) {
+         mesa_loge("syncing host memory BO %d failed: %s\n",
+                   mem->bo->handle, strerror(errno));
+      }
+   }
+#endif
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 v3dv_FlushMappedMemoryRanges(VkDevice _device,
                              uint32_t memoryRangeCount,
                              const VkMappedMemoryRange *pMemoryRanges)
 {
+   V3DV_FROM_HANDLE(v3dv_device, device, _device);
+   sync_mapped_memory_ranges(device, memoryRangeCount, pMemoryRanges);
    return VK_SUCCESS;
 }
 
@@ -2618,6 +2725,8 @@ v3dv_InvalidateMappedMemoryRanges(VkDevice _device,
                                   uint32_t memoryRangeCount,
                                   const VkMappedMemoryRange *pMemoryRanges)
 {
+   V3DV_FROM_HANDLE(v3dv_device, device, _device);
+   sync_mapped_memory_ranges(device, memoryRangeCount, pMemoryRanges);
    return VK_SUCCESS;
 }
 
@@ -2871,6 +2980,13 @@ v3dv_buffer_init(struct v3dv_device *device,
    buffer->size = pCreateInfo->size;
    buffer->usage = vk_buffer_usage_flags(pCreateInfo);
    buffer->alignment = alignment;
+
+   const VkExternalMemoryBufferCreateInfo *external_info =
+      vk_find_struct_const(pCreateInfo->pNext,
+                           EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
+   buffer->host_memory = external_info != NULL &&
+      (external_info->handleTypes &
+       VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT);
 }
 
 static void
@@ -2893,8 +3009,14 @@ get_buffer_memory_requirements(struct v3dv_buffer *buffer,
            readahead = 4;
    }
 
+   uint32_t memory_types = 0x1;
+#if DETECT_OS_HAIKU
+   if (buffer->host_memory)
+      memory_types |= BITFIELD_BIT(V3DV_HOST_IMPORT_MEMORY_TYPE);
+#endif
+
    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements) {
-      .memoryTypeBits = 0x1,
+      .memoryTypeBits = memory_types,
       .alignment = buffer->alignment,
       .size = align64(buffer->size + readahead, buffer->alignment),
    };
@@ -3195,6 +3317,25 @@ v3dv_GetMemoryFdPropertiesKHR(VkDevice _device,
    default:
       return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+v3dv_GetMemoryHostPointerPropertiesEXT(
+   VkDevice _device,
+   VkExternalMemoryHandleTypeFlagBits handleType,
+   const void *pHostPointer,
+   VkMemoryHostPointerPropertiesEXT *pMemoryHostPointerProperties)
+{
+   V3DV_FROM_HANDLE(v3dv_device, device, _device);
+
+#if DETECT_OS_HAIKU
+   if (handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) {
+      pMemoryHostPointerProperties->memoryTypeBits =
+         BITFIELD_BIT(V3DV_HOST_IMPORT_MEMORY_TYPE);
+      return VK_SUCCESS;
+   }
+#endif
+   return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
