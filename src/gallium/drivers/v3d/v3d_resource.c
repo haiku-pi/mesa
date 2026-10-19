@@ -966,6 +966,12 @@ v3d_resource_from_handle(struct pipe_screen *pscreen,
         case WINSYS_HANDLE_TYPE_FD:
                 rsc->bo = v3d_bo_open_dmabuf(screen, whandle->handle);
                 break;
+        case WINSYS_HANDLE_TYPE_KMS:
+                /* a linear buffer: its rows and the offset of the first */
+                rsc->bo = v3d_bo_open_kms_handle(screen, whandle->handle,
+                        align(whandle->offset +
+                              whandle->stride * prsc->height0, 4096));
+                break;
         default:
                 mesa_loge("Attempt to import unsupported handle type %d",
                           whandle->type);

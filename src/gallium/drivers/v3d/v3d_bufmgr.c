@@ -393,6 +393,17 @@ v3d_bo_open_name(struct v3d_screen *screen, uint32_t name)
         return v3d_bo_open_handle(screen, o.handle, o.size);
 }
 
+/* A GEM handle the caller got from the kernel itself (on Haiku: memory it
+ * imported with DRM_V3D_HAIKU_IMPORT_MEMORY).
+ */
+struct v3d_bo *
+v3d_bo_open_kms_handle(struct v3d_screen *screen, uint32_t handle,
+                       uint32_t size)
+{
+        mtx_lock(&screen->bo_handles_mutex);
+        return v3d_bo_open_handle(screen, handle, size);
+}
+
 struct v3d_bo *
 v3d_bo_open_dmabuf(struct v3d_screen *screen, int fd)
 {

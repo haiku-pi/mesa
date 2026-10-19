@@ -61,6 +61,8 @@ struct v3d_bo *v3d_bo_alloc(struct v3d_screen *screen, uint32_t size,
 void v3d_bo_last_unreference(struct v3d_bo *bo);
 void v3d_bo_last_unreference_locked_timed(struct v3d_bo *bo, time_t time);
 struct v3d_bo *v3d_bo_open_name(struct v3d_screen *screen, uint32_t name);
+struct v3d_bo *v3d_bo_open_kms_handle(struct v3d_screen *screen,
+                                     uint32_t handle, uint32_t size);
 struct v3d_bo *v3d_bo_open_dmabuf(struct v3d_screen *screen, int fd);
 bool v3d_bo_flink(struct v3d_bo *bo, uint32_t *name);
 int v3d_bo_get_dmabuf(struct v3d_bo *bo);

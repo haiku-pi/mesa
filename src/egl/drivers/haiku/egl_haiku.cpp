@@ -26,6 +26,8 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include <algorithm>
 
@@ -45,6 +47,8 @@
 #include "state_tracker/st_context.h"
 #include "util/u_atomic.h"
 #include "util/box.h"
+#include "util/u_inlines.h"
+#include "util/os_time.h"
 #include "mesa/glapi/glapi/glapi.h"
 
 #include "hgl/hgl_sw_winsys.h"
@@ -83,12 +87,25 @@ struct haiku_egl_context {
    struct hgl_context *ctx;
 };
 
+// Hardware screens: a window's bitmap as a render target of the GPU (the
+// bitmap's own memory, so presenting needs no copy by the CPU)
+struct imported_bitmap {
+   BBitmap *bitmap;
+   struct pipe_resource *resource;
+   uint32_t handle;
+};
+
 struct haiku_egl_surface {
    _EGLSurface base;
    struct hgl_buffer *fb;
    struct pipe_fence_handle *throttle_fence;
    BBitmap *spare_bitmap; // hardware screens: the bitmap not on screen
+   struct imported_bitmap imported[2];
+      // the two bitmaps that alternate on screen
+   bool no_import; // the driver cannot import them: copy
 };
+
+static void release_import(struct haiku_egl_surface *surface, BBitmap *bitmap);
 
 // #pragma mark EGLSurface
 
@@ -181,6 +198,7 @@ haiku_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
       // Unset bitmap to release ownership. Bitmap will be deleted later
       // when destroying framebuffer.
       BitmapHook *bitmapHook = (BitmapHook*)hgl_surf->fb->winsysContext;
+      release_import(hgl_surf, NULL);
       if (bitmapHook != NULL) {
          BBitmap *shown = bitmapHook->SetBitmap(NULL);
          if (hgl_dpy->hardware)
@@ -209,6 +227,78 @@ update_size(struct hgl_buffer *buffer)
    }
 }
 
+/* Forgets a bitmap's import (before the bitmap goes: its memory stays wired
+ * while the GPU may use it). */
+static void
+release_import(struct haiku_egl_surface *surface, BBitmap *bitmap)
+{
+   for (auto &import : surface->imported) {
+      if (import.resource != NULL && (bitmap == NULL || import.bitmap == bitmap)) {
+         pipe_resource_reference(&import.resource, NULL);
+         import.bitmap = NULL;
+      }
+   }
+}
+
+/*
+ * The GPU copies the frame into the bitmap's own memory, which it imported
+ * once: no CPU copy, no read of the GPU's write-combining memory. Returns
+ * false when the bitmap cannot be imported (then the CPU copies).
+ */
+static bool
+haiku_present_gpu(struct pipe_context *pipe, struct pipe_resource *resource,
+                  struct haiku_egl_surface *surface, BBitmap *bitmap)
+{
+   if (surface->no_import)
+      return false;
+   static const bool disabled = getenv("HAIKU_EGL_NO_IMPORT") != NULL;
+   if (disabled)
+      return false;
+
+   struct pipe_screen *screen = pipe->screen;
+   struct imported_bitmap *slot = NULL;
+   for (auto &import : surface->imported) {
+      if (import.resource != NULL && import.bitmap == bitmap)
+         slot = &import;
+   }
+   if (slot == NULL) {
+      slot = &surface->imported[surface->imported[0].resource == NULL ? 0 : 1];
+      pipe_resource_reference(&slot->resource, NULL);
+      slot->resource = haiku_hw_import_memory(screen, bitmap->Bits(),
+         resource->width0, resource->height0, bitmap->BytesPerRow(),
+         resource->format, &slot->handle);
+      if (slot->resource == NULL) {
+         ERROR("cannot import the window's bitmap: presenting by copying\n");
+         surface->no_import = true;
+         return false;
+      }
+      slot->bitmap = bitmap;
+   }
+
+   // nothing the CPU cached of the bitmap may be written back over the frame
+   haiku_hw_sync_memory(screen, slot->handle);
+
+   struct pipe_blit_info blit;
+   memset(&blit, 0, sizeof(blit));
+   blit.src.resource = resource;
+   blit.src.format = resource->format;
+   u_box_2d(0, 0, resource->width0, resource->height0, &blit.src.box);
+   blit.dst.resource = slot->resource;
+   blit.dst.format = slot->resource->format;
+   blit.dst.box = blit.src.box;
+   blit.mask = PIPE_MASK_RGBA;
+   blit.filter = PIPE_TEX_FILTER_NEAREST;
+   pipe->blit(pipe, &blit);
+
+   // the bitmap is the job's own buffer: wait for it, no fence needed
+   pipe->flush(pipe, NULL, 0);
+   haiku_hw_wait_memory(screen, slot->handle);
+
+   // and nothing stale may be read: the app_server reads it next
+   haiku_hw_sync_memory(screen, slot->handle);
+   return true;
+}
+
 /*
  * Hardware screens have no flush_frontbuffer: the frame is in GPU memory. Copy
  * it into a BBitmap and hand that to the view, which draws it (BitmapHook).
@@ -228,6 +318,7 @@ haiku_present_copy(struct pipe_context *pipe, struct pipe_resource *resource,
    surface->spare_bitmap = NULL;
    if (bitmap == NULL || (unsigned)bitmap->Bounds().IntegerWidth() + 1 != width
        || (unsigned)bitmap->Bounds().IntegerHeight() + 1 != height) {
+      release_import(surface, bitmap);
       delete bitmap;
       // B_RGB32 is B, G, R, X in memory: the visual's BGRX/BGRA8888 format
       bitmap = new BBitmap(BRect(0, 0, width - 1, height - 1), B_RGB32);
@@ -235,6 +326,11 @@ haiku_present_copy(struct pipe_context *pipe, struct pipe_resource *resource,
          delete bitmap;
          return;
       }
+   }
+
+   if (haiku_present_gpu(pipe, resource, surface, bitmap)) {
+      surface->spare_bitmap = hook->SetBitmap(bitmap);
+      return;
    }
 
    struct pipe_box box;
