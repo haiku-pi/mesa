@@ -122,6 +122,20 @@ struct haiku_egl_surface {
 
 static void release_import(struct haiku_egl_surface *surface, BBitmap *bitmap);
 
+/* A signal interrupts a semaphore wait (B_INTERRUPTED): the program's handler
+ * runs on whichever thread took it, the presenter or the render thread. Neither
+ * may take that for its partner's release -- the presenter quit then, and the
+ * render thread waited for it at the next swap, for ever. */
+static status_t
+acquire_sem_uninterrupted(sem_id sem)
+{
+   status_t status;
+   do {
+      status = acquire_sem(sem);
+   } while (status == B_INTERRUPTED);
+   return status;
+}
+
 // #pragma mark EGLSurface
 
 // Called via eglCreateWindowSurface(), drv->CreateWindowSurface().
@@ -212,11 +226,12 @@ haiku_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
 
       if (hgl_surf->presenter > 0) {
          if (hgl_surf->presenting)
-            acquire_sem(hgl_surf->presented_sem);
+            acquire_sem_uninterrupted(hgl_surf->presented_sem);
          hgl_surf->quit = true;
          release_sem(hgl_surf->present_sem);
          status_t result;
-         wait_for_thread(hgl_surf->presenter, &result);
+         while (wait_for_thread(hgl_surf->presenter, &result) == B_INTERRUPTED)
+            ; // the presenter uses the surface until it has returned
          delete_sem(hgl_surf->present_sem);
          delete_sem(hgl_surf->presented_sem);
       }
@@ -332,7 +347,8 @@ haiku_presenter(void *data)
 {
    struct haiku_egl_surface *surface = (struct haiku_egl_surface *)data;
    BitmapHook *hook = (BitmapHook *)surface->fb->winsysContext;
-   while (acquire_sem(surface->present_sem) == B_OK && !surface->quit) {
+   while (acquire_sem_uninterrupted(surface->present_sem) == B_OK
+          && !surface->quit) {
       haiku_hw_wait_memory(surface->present_screen, surface->pending_slot->handle);
       haiku_hw_sync_memory(surface->present_screen, surface->pending_slot->handle);
       surface->spare_bitmap = hook->SetBitmap(surface->pending_bitmap);
@@ -356,7 +372,7 @@ haiku_present_copy(struct pipe_context *pipe, struct pipe_resource *resource,
 
    // the previous frame's bitmap is on screen and the one before is spare again
    if (surface->presenting) {
-      acquire_sem(surface->presented_sem);
+      acquire_sem_uninterrupted(surface->presented_sem);
       surface->presenting = false;
    }
 
