@@ -123,7 +123,9 @@ def declare_options(android_version):
         B("anv_write_lookup_maps_unconditionally", False,
           "Unconditionally write lookup maps for BLAS update operation",
           c_name="write_lookup_maps_unconditionally"),
-
+        B("anv_disable_xe_engine_cycles", False,
+          "Disable use of DRM_XE_DEVICE_QUERY_ENGINE_CYCLES on Xe",
+          c_name="disable_xe_engine_cycles"),
         # Workaround command emission
         B("anv_barrier_post_untyped_clear_shader", False,
           "Insert pipeline barriers post clearing shader on untyped data",
@@ -246,6 +248,9 @@ def declare_options(android_version):
         B("compression_control_enabled", android_version >= 37,
           "Enable VK_EXT_image_compression_control support",
           c_name="compression_control_enabled"),
+        B("anv_always_bindless", False,
+          "Forces all descriptor sets to use the internal bindless model",
+          c_name="always_bindless"),
     ]
 
     misc_options = []

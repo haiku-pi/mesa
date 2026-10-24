@@ -1818,22 +1818,21 @@ anv_physical_device_has_vram(const struct anv_physical_device *device)
 }
 
 enum anv_debug {
-   ANV_DEBUG_BINDLESS                   = BITFIELD_BIT(0),
-   ANV_DEBUG_NO_GPL                     = BITFIELD_BIT(1),
-   ANV_DEBUG_NO_SECONDARY_CALL          = BITFIELD_BIT(2),
-   ANV_DEBUG_NO_SPARSE                  = BITFIELD_BIT(3),
-   ANV_DEBUG_SPARSE_TRTT                = BITFIELD_BIT(4),
-   ANV_DEBUG_VIDEO_DECODE               = BITFIELD_BIT(5),
-   ANV_DEBUG_VIDEO_ENCODE               = BITFIELD_BIT(6),
-   ANV_DEBUG_SHADER_HASH                = BITFIELD_BIT(7),
-   ANV_DEBUG_NO_SLAB                    = BITFIELD_BIT(8),
-   ANV_DEBUG_DESCRIPTOR_DIRTY           = BITFIELD_BIT(9),
-   ANV_DEBUG_SHADER_PRINT               = BITFIELD_BIT(10),
-   ANV_DEBUG_SHADER_DUMP                = BITFIELD_BIT(11),
-   ANV_DEBUG_EXPERIMENTAL               = BITFIELD_BIT(12),
-   ANV_DEBUG_DGC_DUMP                   = BITFIELD_BIT(13),
-   ANV_DEBUG_NO_ALLOC_OVER_SUBSCRIPTION = BITFIELD_BIT(14),
-   ANV_DEBUG_SKIP_DISK_CACHE            = BITFIELD_BIT(15),
+   ANV_DEBUG_NO_GPL                     = BITFIELD_BIT(0),
+   ANV_DEBUG_NO_SECONDARY_CALL          = BITFIELD_BIT(1),
+   ANV_DEBUG_NO_SPARSE                  = BITFIELD_BIT(2),
+   ANV_DEBUG_SPARSE_TRTT                = BITFIELD_BIT(3),
+   ANV_DEBUG_VIDEO_DECODE               = BITFIELD_BIT(4),
+   ANV_DEBUG_VIDEO_ENCODE               = BITFIELD_BIT(5),
+   ANV_DEBUG_SHADER_HASH                = BITFIELD_BIT(6),
+   ANV_DEBUG_NO_SLAB                    = BITFIELD_BIT(7),
+   ANV_DEBUG_DESCRIPTOR_DIRTY           = BITFIELD_BIT(8),
+   ANV_DEBUG_SHADER_PRINT               = BITFIELD_BIT(9),
+   ANV_DEBUG_SHADER_DUMP                = BITFIELD_BIT(10),
+   ANV_DEBUG_EXPERIMENTAL               = BITFIELD_BIT(11),
+   ANV_DEBUG_DGC_DUMP                   = BITFIELD_BIT(12),
+   ANV_DEBUG_NO_ALLOC_OVER_SUBSCRIPTION = BITFIELD_BIT(13),
+   ANV_DEBUG_SKIP_DISK_CACHE            = BITFIELD_BIT(14),
 };
 
 extern enum anv_debug anv_debug;
@@ -4817,6 +4816,13 @@ struct anv_cmd_state {
        * the command streamer or a shader.
        */
       enum anv_query_bits                          clear_bits;
+
+      /**
+       * Tracks query pool copy synchronization bits that will need to be
+       * flushed before doing work in vkCmdQueryReset. If a copy operation is
+       * in flight, we need for it complete before resetting the query pool.
+       */
+      enum anv_query_bits                          copy_bits;
    } queries;
 
    /** Tracks whether 3DSTATE_BINDING_TABLE_POINTERS_* instructions need

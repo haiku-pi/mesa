@@ -586,7 +586,8 @@ radv_dump_shader(struct radv_device *device, struct radv_pipeline *pipeline, str
       _mesa_blake3_compute(shader->dbg.spirv, shader->dbg.spirv_size, blake3);
       _mesa_blake3_format(blake3buf, blake3);
 
-      if (device->vk.enabled_features.deviceFaultVendorBinaryEXT) {
+      if (device->vk.enabled_features.deviceFaultVendorBinaryEXT ||
+          device->vk.enabled_features.deviceFaultVendorBinary) {
          spirv_print_asm(f, (const uint32_t *)shader->dbg.spirv, shader->dbg.spirv_size / 4);
       } else {
          fprintf(f, "SPIRV (see %s.spv)\n\n", blake3buf);
@@ -936,6 +937,14 @@ radv_vm_fault_occurred(struct radv_device *device, struct radv_winsys_gpuvm_faul
    return device->ws->query_gpuvm_fault(device->ws, fault_info);
 }
 
+bool
+radv_shader_abort_occurred(struct radv_device *device)
+{
+   const uint32_t *data = device->shader_abort.buffer.map;
+   /* Check if something was written to the abort buffer. */
+   return data && data[0] != sizeof(uint32_t);
+}
+
 enum radv_device_fault_chunk {
    RADV_DEVICE_FAULT_CHUNK_TRACE,
    RADV_DEVICE_FAULT_CHUNK_QUEUE_STATE,
@@ -997,7 +1006,8 @@ radv_check_gpu_hangs(struct radv_queue *queue, const struct radv_winsys_submit_i
 #ifndef _WIN32
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const struct radv_instance *instance = radv_physical_device_instance(pdev);
-   const bool save_hang_report = !device->vk.enabled_features.deviceFaultVendorBinaryEXT;
+   const bool save_hang_report =
+      !(device->vk.enabled_features.deviceFaultVendorBinaryEXT || device->vk.enabled_features.deviceFaultVendorBinary);
    struct radv_winsys_gpuvm_fault_info fault_info = {0};
 
    /* Query if a VM fault happened for this GPU hang. */

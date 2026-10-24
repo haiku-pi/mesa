@@ -467,7 +467,9 @@ vcn_enc_caps(struct radeon_info *info)
    cap->hevc.log2_diff_max_min_luma_transform_block_size = 3;
    cap->formats.nv12 = 1;
    cap->formats.p010 = cap->hevc.main10 ? 1 : 0;
-   cap->min_qp = 0;
+   /* There is a FW bug causing QP to be clamped to 1, only when QP map is
+    * enabled in CQP mode. */
+   cap->min_qp = info->vcn_ip_version < VCN_3_0_0 ? 1 : 0;
    cap->max_qp = 51;
 
    /* AV1 Encode */
@@ -693,13 +695,11 @@ ac_fill_video_info(struct radeon_info *info, struct ac_drm_device *dev)
          info->video_caps.dec[codec].supported &= dec_cap[i].valid;
          info->video_caps.dec[codec].max_width = dec_cap[i].max_width;
          info->video_caps.dec[codec].max_height = dec_cap[i].max_height;
-         info->video_caps.dec[codec].max_level = dec_cap[i].max_level;
       }
       if (codec < AC_VIDEO_CODEC_ENC_MAX) {
          info->video_caps.enc[codec].supported &= enc_cap[i].valid;
          info->video_caps.enc[codec].max_width = enc_cap[i].max_width;
          info->video_caps.enc[codec].max_height = enc_cap[i].max_height;
-         info->video_caps.enc[codec].max_level = enc_cap[i].max_level;
       }
    }
 }

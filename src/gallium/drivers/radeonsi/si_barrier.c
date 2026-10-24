@@ -83,7 +83,7 @@ static unsigned get_reduced_barrier_flags(struct si_context *ctx)
    if (flags & (SI_BARRIER_SYNC_AND_INV_CB | SI_BARRIER_SYNC_AND_INV_DB | SI_BARRIER_SYNC_PS)) {
       ctx->last_ps_sync_num_draw_calls = ctx->num_draw_calls;
       ctx->last_vs_sync_num_draw_calls = ctx->num_draw_calls;
-   } else if (SI_BARRIER_SYNC_VS) {
+   } else if (flags & SI_BARRIER_SYNC_VS) {
       ctx->last_vs_sync_num_draw_calls = ctx->num_draw_calls;
    }
 
@@ -447,7 +447,7 @@ static void gfx6_emit_barrier(struct si_context *sctx, struct radeon_cmdbuf *cs)
       si_cp_wait_mem(sctx, cs, va, sctx->wait_mem_number, 0xffffffff, WAIT_REG_MEM_EQUAL);
 
       if (unlikely(sctx->sqtt_enabled)) {
-         si_sqtt_describe_barrier_end(sctx, cs, sctx->barrier_flags);
+         si_sqtt_describe_barrier_end(sctx, cs, flags);
       }
    }
 
@@ -536,11 +536,11 @@ void si_barrier_before_internal_op(struct si_context *sctx, unsigned flags,
    }
 
    /* Don't sync if buffers are idle. */
-   const unsigned ps_mask = SI_BIND_CONSTANT_BUFFER(MESA_SHADER_FRAGMENT) |
+   const uint64_t ps_mask = SI_BIND_CONSTANT_BUFFER(MESA_SHADER_FRAGMENT) |
                             SI_BIND_SHADER_BUFFER(MESA_SHADER_FRAGMENT) |
                             SI_BIND_IMAGE_BUFFER(MESA_SHADER_FRAGMENT) |
                             SI_BIND_SAMPLER_BUFFER(MESA_SHADER_FRAGMENT);
-   const unsigned cs_mask = SI_BIND_CONSTANT_BUFFER(MESA_SHADER_COMPUTE) |
+   const uint64_t cs_mask = SI_BIND_CONSTANT_BUFFER(MESA_SHADER_COMPUTE) |
                             SI_BIND_SHADER_BUFFER(MESA_SHADER_COMPUTE) |
                             SI_BIND_IMAGE_BUFFER(MESA_SHADER_COMPUTE) |
                             SI_BIND_SAMPLER_BUFFER(MESA_SHADER_COMPUTE);

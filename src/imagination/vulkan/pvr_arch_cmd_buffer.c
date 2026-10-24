@@ -1951,7 +1951,7 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
        * every color attachment in this render.
        */
       job->samples = hw_render->sample_count;
-   } else if (cmd_buffer->state.gfx_pipeline) {
+   } else if (!dynamic_state->rs.rasterizer_discard_enable) {
       /* If the HW render pass has no color or depth/stencil attachments, we
        * determine the sample count from the count given during pipeline
        * creation.
@@ -4677,7 +4677,7 @@ pvr_dynamic_render_info_create(struct pvr_cmd_buffer *cmd_buffer,
          resolve_ds_attach->store_op = ds_attach->store_op;
          resolve_ds_attach->stencil_store_op = ds_attach->stencil_store_op;
          resolve_ds_attach->load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-         resolve_ds_attach->stencil_load_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+         resolve_ds_attach->stencil_load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
 
          attach_idx++;
       }
@@ -4754,7 +4754,9 @@ void PVR_PER_ARCH(CmdBeginRendering)(VkCommandBuffer commandBuffer,
    bool resume, suspend;
    VkResult result;
 
-   /* TODO: Check not in renderpess? */
+   PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+
+   /* TODO: Check not in renderpass? */
 
    suspend = pRenderingInfo->flags & VK_RENDERING_SUSPENDING_BIT_KHR;
    resume = pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT_KHR;
@@ -4882,6 +4884,8 @@ void PVR_PER_ARCH(CmdEndRendering)(VkCommandBuffer commandBuffer)
    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
    struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
    VkResult result;
+
+   PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
    if (state->current_sub_cmd && state->current_sub_cmd->is_suspend) {
       return;
@@ -8153,7 +8157,8 @@ static void pvr_emit_dirty_vdm_state(struct pvr_cmd_buffer *const cmd_buffer,
    pvr_csb_emit (csb, VDMCTRL_VDM_STATE0, state0) {
       state0.cam_size = cam_size;
 
-      if (dynamic_state->ia.primitive_restart_enable) {
+      if (state->draw_state.draw_indexed &&
+          dynamic_state->ia.primitive_restart_enable) {
          state0.cut_index_enable = true;
          state0.cut_index_present = true;
       }

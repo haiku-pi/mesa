@@ -99,6 +99,7 @@ struct dri_drawable
    bool window_valid;
 #ifdef VK_USE_PLATFORM_XCB_KHR
    xcb_special_event_t *special_event;
+   uint32_t present_eid;
 #endif
 
    /* hooks filled in by dri2 & drisw */
@@ -145,6 +146,13 @@ void
 dri_pipe_blit(struct pipe_context *pipe,
               struct pipe_resource *dst,
               struct pipe_resource *src);
+
+void
+dri_drawable_allocate_msaa_textures(struct dri_context *ctx,
+                                    struct dri_drawable *drawable,
+                                    const enum st_attachment_type *statts,
+                                    unsigned statts_count,
+                                    const struct pipe_resource *templ);
 
 void
 dri_flush(struct dri_context *ctx,

@@ -504,7 +504,8 @@ ac_fill_hw_ip_info(struct radeon_info *info, const struct drm_amdgpu_info_device
       if (device_info->family == FAMILY_NV &&
             (ASICREV_IS(device_info->external_rev, NAVI10) ||
             ASICREV_IS(device_info->external_rev, NAVI12) ||
-            ASICREV_IS(device_info->external_rev, NAVI14)))
+            ASICREV_IS(device_info->external_rev, NAVI14) ||
+            ASICREV_IS(device_info->external_rev, GFX1013)))
          info->ip[AMD_IP_GFX].ver_minor = info->ip[AMD_IP_COMPUTE].ver_minor = 1;
       else if (device_info->family == FAMILY_NV ||
                device_info->family == FAMILY_VGH ||
@@ -740,6 +741,7 @@ ac_identify_chip(struct radeon_info *info, const struct drm_amdgpu_info_device *
          break;
       case FAMILY_GFX1170:
          identify_chip(GFX1170);
+         identify_chip(GFX1171);
          break;
       case FAMILY_NV4:
          if (info->ip[AMD_IP_GFX].ver_minor == 0) {
@@ -1647,10 +1649,10 @@ ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
       info->pcie_bandwidth_mbps = info->pcie_num_lanes * 0.985 * 1024;
       break;
    case 4:
-      info->pcie_bandwidth_mbps = info->pcie_num_lanes * 1.969 * 1024;
+      info->pcie_bandwidth_mbps = info->pcie_num_lanes * 1.970 * 1024;
       break;
    case 5:
-      info->pcie_bandwidth_mbps = info->pcie_num_lanes * 3.938 * 1024;
+      info->pcie_bandwidth_mbps = info->pcie_num_lanes * 3.940 * 1024;
       break;
    case 6:
       info->pcie_bandwidth_mbps = info->pcie_num_lanes * 7.563 * 1024;

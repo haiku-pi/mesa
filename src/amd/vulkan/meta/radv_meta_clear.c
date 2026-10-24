@@ -11,6 +11,7 @@
 #include "radv_tracepoints.h"
 
 #include "util/format_rgb9e5.h"
+#include "util/format_srgb.h"
 #include "vk_format.h"
 #include "vk_shader_module.h"
 
@@ -657,7 +658,8 @@ radv_get_htile_mask(struct radv_cmd_buffer *cmd_buffer, const struct radv_image 
          if (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
             mask |= HTILE_ZS_CODE(.zmask = 0xF,
                                   .zdelta = 0x3F,
-                                  .zbase = 0x3FFF);
+                                  .zbase = 0x3FFF,
+                                  .unused = 0x3);
          }
          if (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
             mask |= HTILE_ZS_CODE(.sr0 = 0x3,
@@ -1496,6 +1498,11 @@ emit_clear(struct radv_cmd_buffer *cmd_buffer, const VkClearAttachment *clear_at
       if (ds_att->format == VK_FORMAT_UNDEFINED)
          return;
 
+      /* Ignore aspects that have no effects. */
+      aspects &= render->ds_att_aspects;
+      if (!aspects)
+         return;
+
       VkClearDepthStencilValue clear_value = clear_att->clearValue.depthStencil;
 
       assert(aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
@@ -1515,10 +1522,10 @@ emit_clear(struct radv_cmd_buffer *cmd_buffer, const VkClearAttachment *clear_at
       }
 
       if (can_fast_clear_depth && can_fast_clear_stencil) {
-         radv_fast_clear_depth(cmd_buffer, ds_att->iview, clear_att->clearValue.depthStencil, clear_att->aspectMask,
+         radv_fast_clear_depth(cmd_buffer, ds_att->iview, clear_att->clearValue.depthStencil, aspects,
                                pre_flush, post_flush);
       } else if (!can_fast_clear_depth && !can_fast_clear_stencil) {
-         emit_depthstencil_clear(cmd_buffer, clear_att->clearValue.depthStencil, clear_att->aspectMask, clear_rect,
+         emit_depthstencil_clear(cmd_buffer, clear_att->clearValue.depthStencil, aspects, clear_rect,
                                  view_mask);
       } else {
          if (can_fast_clear_depth) {
@@ -1820,6 +1827,15 @@ radv_cmd_clear_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *imag
       internal_clear_value.color = clear_value->color;
    else
       internal_clear_value.depthStencil = clear_value->depthStencil;
+
+   if (cs && vk_format_is_srgb(image->vk.format)) {
+      format = vk_format_no_srgb(image->vk.format);
+
+      for (unsigned i = 0; i < 3; i++) {
+         internal_clear_value.color.float32[i] =
+            util_format_linear_to_srgb_float(internal_clear_value.color.float32[i]);
+      }
+   }
 
    if (format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) {
       if (cs ? !radv_is_storage_image_format_supported(pdev, format)

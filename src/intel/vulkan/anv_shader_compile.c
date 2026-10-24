@@ -117,24 +117,41 @@ is_local_invoc_id_used_with_simd32_assumption(nir_intrinsic_instr *subgroup_inv)
          continue;
 
       nir_alu_instr *alu = nir_instr_as_alu(instr);
-      if (alu->op != nir_op_iand)
-         continue;
 
-      /* nir_print_instr(&alu->instr, stderr); */
-      /* fprintf(stderr, "\n"); */
+      switch (alu->op) {
+      case nir_op_iand:
+         for (uint32_t i = 0; i < 2; i++) {
+            if (&alu->src[i].src == src)
+               continue;
 
-      for (uint32_t i = 0; i < 2; i++) {
-         if (&alu->src[i].src == src)
-            continue;
+            if (!nir_src_is_const(alu->src[i].src))
+               continue;
 
-         if (!nir_src_is_const(alu->src[i].src))
-            continue;
+            if (nir_src_as_uint(alu->src[i].src) != 0xffffffe0)
+               continue;
 
-         if (nir_src_as_uint(alu->src[i].src) != 0xffffffe0)
-            continue;
-
-         if (is_alu_used_for_umod_subgroup_size(alu))
+            if (is_alu_used_for_umod_subgroup_size(alu))
+               return true;
+         }
+         break;
+      /* Detect if we have local invocation id divided by BRW_SUBGROUP_SIZE. */
+      case nir_op_ushr:
+         if (alu->src[0].src.ssa == &subgroup_inv->def &&
+             nir_src_is_const(alu->src[1].src) &&
+             nir_src_as_int(alu->src[1].src) == 5) {
             return true;
+         }
+         break;
+      case nir_op_udiv:
+      case nir_op_idiv:
+         if (alu->src[0].src.ssa == &subgroup_inv->def &&
+             nir_src_is_const(alu->src[1].src) &&
+             nir_src_as_int(alu->src[1].src) == 32) {
+            return true;
+         }
+         break;
+      default:
+         break;
       }
    }
 
@@ -222,7 +239,7 @@ anv_shader_init_uuid(struct anv_physical_device *device)
                        sizeof(device->driver_build_sha1));
    brw_device_blake3_update(&ctx, &device->info);
 
-   const bool always_bindless = !!ANV_DEBUG(BINDLESS);
+   const bool always_bindless = device->instance->drirc.features.always_bindless;
    _mesa_blake3_update(&ctx, &always_bindless, sizeof(always_bindless));
 
    const bool indirect_descriptors = device->indirect_descriptors;
@@ -756,10 +773,13 @@ anv_shader_hash_state(struct vk_physical_device *device,
          populate_mesh_prog_key(&key.mesh, device, NULL, state, stages);
          _mesa_blake3_update(&blake3_ctx, &key.mesh, sizeof(key.mesh));
          break;
-      case VK_SHADER_STAGE_FRAGMENT_BIT:
+      case VK_SHADER_STAGE_FRAGMENT_BIT: {
+         uint32_t color_mask = rp_color_mask(state);
+         _mesa_blake3_update(&blake3_ctx, &color_mask, sizeof(color_mask));
          populate_fs_prog_key(&key.fs, device, NULL, state, stages);
          _mesa_blake3_update(&blake3_ctx, &key.fs, sizeof(key.fs));
          break;
+      }
       case VK_SHADER_STAGE_COMPUTE_BIT:
          populate_cs_prog_key(&key.cs, device, NULL);
          _mesa_blake3_update(&blake3_ctx, &key.cs, sizeof(key.cs));
@@ -1437,19 +1457,6 @@ anv_shader_lower_nir(struct anv_device *device,
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       anv_shader_compute_fragment_rts(devinfo, state, shader_data);
 
-   uint32_t dynamic_descriptors_offset = 0;
-   uint32_t dynamic_descriptors_offsets[MAX_SETS] = {};
-   for (uint32_t i = 0; i < set_layout_count; i++) {
-      dynamic_descriptors_offsets[i] = dynamic_descriptors_offset;
-      if (set_layouts[i] != NULL) {
-         shader_data->bind_map.binding_mask |= ANV_PIPELINE_BIND_MASK_SET(i);
-         const uint32_t dyn_desc_count =
-            set_layouts[i]->vk.dynamic_descriptor_count;
-         shader_data->bind_map.dynamic_descriptors[i] = dyn_desc_count;
-         dynamic_descriptors_offset += dyn_desc_count;
-      }
-   }
-
    /* Apply the actual layout to UBOs, SSBOs, and textures */
    if (shader_data->info->flags & VK_SHADER_CREATE_DESCRIPTOR_HEAP_BIT_EXT) {
       NIR_PASS(_, nir, anv_nir_lower_descriptor_heap, device,
@@ -1460,9 +1467,6 @@ anv_shader_lower_nir(struct anv_device *device,
       NIR_PASS(_, nir, anv_nir_apply_pipeline_layout,
                pdevice, shader_data->key.base.robust_flags,
                set_layouts, set_layout_count,
-               (shader_data->info->flags &
-                VK_SHADER_CREATE_INDEPENDENT_SETS_BIT_KHR) ? NULL :
-               dynamic_descriptors_offsets,
                shader_data->info->flags & VK_SHADER_CREATE_INDIRECT_BINDABLE_BIT_EXT,
                &shader_data->bind_map, &shader_data->push_map, mem_ctx);
    }

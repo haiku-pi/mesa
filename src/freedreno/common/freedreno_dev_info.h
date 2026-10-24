@@ -136,6 +136,17 @@ struct fd_dev_info {
        */
       bool indirect_draw_wfm_quirk;
 
+      /* The latest a630_sqe.fw can access PC_AUTO_VERTEX_STRIDE before it's
+       * being written by CP, so we have to write it manually before using
+       * CP_DRAW_AUTO.
+       *
+       * TODO: There may be newer a630_sqe.fw released in the future
+       * which fixes this, if so we should detect it and avoid this
+       * workaround.  Once we have uapi to query fw version, we can
+       * replace this with minimum fw version.
+       */
+      bool draw_auto_stale_stride_quirk;
+
       /* On some GPUs, the depth test needs to be enabled when the
        * depth bounds test is enabled and the depth attachment uses UBWC.
        */
@@ -304,6 +315,9 @@ struct fd_dev_info {
 
       /* A702 cuts A LOT of things.. */
       bool is_a702;
+
+      /* Number of transform feedback streams supported. */
+      uint32_t num_xfb_streams;
 
       /* maximum number of descriptor sets */
       uint32_t max_sets;

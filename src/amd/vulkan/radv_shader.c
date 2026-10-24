@@ -61,7 +61,8 @@ get_nir_options_for_stage(struct radv_compiler_info *compiler_info, mesa_shader_
    ac_nir_set_options(compiler_info->ac, compiler_info->key.use_llvm, options);
 
    if (split_fma) {
-      options->float_mul_add16 |= nir_float_muladd_support_prefers_split;
+      if (options->float_mul_add16 & nir_float_muladd_support_has_ffma)
+         options->float_mul_add16 |= nir_float_muladd_support_prefers_split;
       options->float_mul_add32 |= nir_float_muladd_support_prefers_split;
       options->float_mul_add64 |= nir_float_muladd_support_prefers_split;
    }
@@ -282,7 +283,11 @@ radv_optimize_nir_algebraic_early(nir_shader *nir)
 void
 radv_optimize_nir_algebraic_late(nir_shader *nir)
 {
-   NIR_PASS(_, nir, nir_opt_reassociate_for_fma);
+   /* Invariant position doesn't cover generic VS outputs used
+    * to compute position in later stages.
+    */
+   if (nir->info.stage != MESA_SHADER_VERTEX || nir->info.next_stage == MESA_SHADER_FRAGMENT)
+      NIR_PASS(_, nir, nir_opt_reassociate_for_fma);
 
    /* Do late algebraic optimization to turn add(a,
     * neg(b)) back into subs, then the mandatory cleanup
@@ -523,6 +528,7 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct 
                .force_ssbo_non_uniform = compiler_info->key.ssbo_non_uniform,
                .lower_terminate_to_discard = compiler_info->key.lower_terminate_to_discard,
                .force_nan_preserve_min_max = compiler_info->key.force_nan_preserve_min_max,
+               .force_exact_glsl_fma = compiler_info->key.force_exact_glsl_fma,
             },
          .emit_debug_break = compiler_info->debug.trap_enabled,
          .debug_info = compiler_info->key.nir_debug_info,

@@ -124,15 +124,19 @@ nir_io_offset_iadd(nir_builder *b, nir_intrinsic_instr *intr,
          base_shift = 0;
          offset_shift = cur_offset_shift;
       } else {
-         /* TODO add support for adjusting the base index. */
-         assert(!nir_intrinsic_has_base(intr) || nir_intrinsic_base(intr) == 0);
+         unsigned offset = offset_diff_bytes;
+
+         if (nir_intrinsic_has_base(intr)) {
+            offset += nir_intrinsic_base(intr) << cur_offset_shift;
+            nir_intrinsic_set_base(intr, 0);
+         }
 
          /* Otherwise, we have to lower offset_shift in order to not lose
           * precision. We also have to shift the original base offset left to
           * make sure it uses the same units.
           */
-         offset_shift = ffs(offset_diff_bytes) - 1;
-         offset_diff = offset_diff_bytes >> offset_shift;
+         offset_shift = ffs(offset) - 1;
+         offset_diff = offset >> offset_shift;
          base_shift = cur_offset_shift - offset_shift;
       }
    } else {
@@ -517,6 +521,7 @@ lower_load(nir_intrinsic_instr *intrin, struct lower_io_state *state,
          nir_def *data32 =
             emit_load(state, array_index, var, offset, component,
                       num_comps * 2, 32, nir_type_uint32, high_dvec2);
+         data32 = nir_64_2x32_memory_order(b, data32);
          for (unsigned i = 0; i < num_comps; i++) {
             comp64[dest_comp + i] =
                nir_pack_64_2x32(b, nir_channels(b, data32, 3 << (i * 2)));
@@ -673,7 +678,8 @@ lower_store(nir_intrinsic_instr *intrin, struct lower_io_state *state,
             nir_def *data =
                nir_channels(b, intrin->src[1].ssa,
                             BITFIELD_RANGE(src_comp, num_comps));
-            nir_def *data32 = nir_bitcast_vector(b, data, 32);
+            nir_def *data32 =
+               nir_64_2x32_memory_order(b, nir_bitcast_vector(b, data, 32));
 
             uint32_t write_mask32 = 0;
             for (unsigned i = 0; i < num_comps; i++) {
