@@ -358,7 +358,11 @@ vir_live_variables_defin_defout_dataflow(struct v3d_compile *c, int bitset_words
 {
         bool cont = false;
 
-        vir_for_each_block_rev(block, c) {
+        /* A forward problem: in program order a definition reaches the end
+         * of an acyclic region in one pass (in reverse order it moved one
+         * block per pass, and a big unrolled shader took hundreds of passes).
+         */
+        vir_for_each_block(block, c) {
                 /* Propagate defin/defout down the successors to produce the
                  * union of blocks with a reachable (partial) definition of
                  * the var.
