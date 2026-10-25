@@ -1381,6 +1381,22 @@ ntq_emit_alu(struct v3d_compile *c, nir_alu_instr *instr)
                 return;
         }
 
+        /* Movs are the other ALU op that can still be a vector here:
+         * nir_trivialize_registers copies whole registers with them (e.g.
+         * a vec4 phi web whose source lives in another register), so move
+         * every channel, not only the first.
+         */
+        if (instr->op == nir_op_mov && instr->def.num_components > 1) {
+                struct qreg srcs[NIR_MAX_VEC_COMPONENTS];
+                for (int i = 0; i < instr->def.num_components; i++)
+                        srcs[i] = ntq_get_src(c, instr->src[0].src,
+                                              instr->src[0].swizzle[i]);
+                for (int i = 0; i < instr->def.num_components; i++)
+                        ntq_store_def(c, &instr->def, i,
+                                      vir_MOV(c, srcs[i]));
+                return;
+        }
+
         /* General case: We can just grab the one used channel per src. */
         assert(nir_op_infos[instr->op].num_inputs <= 3);
         struct qreg src[3] = { 0 };
