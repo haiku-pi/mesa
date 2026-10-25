@@ -98,6 +98,10 @@ disk_cache_get_function_identifier(void *ptr, blake3_hasher *ctx)
 #include <sys/statvfs.h>
 #include <unistd.h>
 #include "utime.h"
+#if DETECT_OS_HAIKU
+#include <limits.h>
+#include <FindDirectory.h>
+#endif
 
 #include "util/blob.h"
 #include "util/crc32.h"
@@ -1013,6 +1017,21 @@ disk_cache_generate_cache_dir(void *mem_ctx, const char *gpu_name,
             return NULL;
       }
    }
+
+#if DETECT_OS_HAIKU
+   /* Haiku keeps per-user caches in ~/config/cache. */
+   if (!path) {
+      char haiku_cache[PATH_MAX];
+
+      if (find_directory(B_USER_CACHE_DIRECTORY, -1, true, haiku_cache,
+                         sizeof(haiku_cache)) == B_OK) {
+         path = concatenate_and_mkdir(mem_ctx, haiku_cache, cache_dir_name,
+                                      mkdir);
+         if (!path)
+            return NULL;
+      }
+   }
+#endif
 
    if (!path) {
       const char *home = os_get_option("HOME");

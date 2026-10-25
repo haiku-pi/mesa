@@ -1771,6 +1771,12 @@ endif
 
 if cc.has_function('dl_iterate_phdr')
   pre_args += '-DHAVE_DL_ITERATE_PHDR'
+elif host_machine.system() == 'haiku' and \
+     cc.has_function('dl_iterate_phdr', dependencies : cc.find_library('bsd'))
+  # Haiku has it in libbsd (declared by <link.h>); the drivers' shader cache
+  # keys use the build ID it finds.
+  pre_args += '-DHAVE_DL_ITERATE_PHDR'
+  dep_dl = cc.find_library('bsd')
 elif with_intel_vk or with_intel_hasvk
   error('Intel "Anvil" Vulkan driver requires the dl_iterate_phdr function')
 endif
