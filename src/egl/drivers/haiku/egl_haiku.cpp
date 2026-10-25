@@ -689,6 +689,10 @@ haiku_initialize(_EGLDisplay *disp)
 static EGLBoolean
 haiku_terminate(_EGLDisplay *disp)
 {
+   /* A context still current keeps its own reference to the display (see
+    * haiku_make_current()), so the display outlives eglTerminate() until it
+    * is released, as with the DRI2 driver. */
+   _eglReleaseDisplayResources(disp);
    haiku_display_destroy(disp);
    return EGL_TRUE;
 }
@@ -792,6 +796,8 @@ haiku_make_current(_EGLDisplay *disp, _EGLSurface *dsurf, _EGLSurface *rsurf,
       return EGL_TRUE;
    }
 
+   _EGLDisplay *old_disp = old_ctx != NULL ? old_ctx->Resource.Display : NULL;
+
    if (ctx == NULL) {
       st_api_make_current(NULL, NULL, NULL);
    } else {
@@ -801,14 +807,20 @@ haiku_make_current(_EGLDisplay *disp, _EGLSurface *dsurf, _EGLSurface *rsurf,
       st_api_make_current(hgl_ctx->ctx->st,
                           hgl_dsurf == NULL ? NULL : &hgl_dsurf->fb->base,
                           hgl_rsurf == NULL ? NULL : &hgl_rsurf->fb->base);
+
+      /* A bound context holds a reference to its display: eglTerminate()
+       * while it is current must not free what releasing it needs. */
+      p_atomic_inc(&haiku_egl_display(disp)->ref_count);
    }
 
    if (old_dsurf != NULL)
       haiku_destroy_surface(disp, old_dsurf);
    if (old_rsurf != NULL)
       haiku_destroy_surface(disp, old_rsurf);
-   if (old_ctx != NULL)
+   if (old_ctx != NULL) {
       haiku_destroy_context(disp, old_ctx);
+      haiku_display_destroy(old_disp);
+   }
 
    return EGL_TRUE;
 }
