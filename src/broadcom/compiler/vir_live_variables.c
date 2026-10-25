@@ -30,6 +30,10 @@
 
 /* Keeps track of conditional / partial writes in a block */
 struct partial_update_state {
+        /* The block the state belongs to (its index + 1): a state of another
+         * block reads as zeroed, so the array needn't be cleared per block.
+         */
+        uint32_t block;
         /* Instruction doing a conditional or partial write */
         struct qinst *inst;
         /* Instruction that set the flags for the conditional write */
@@ -99,6 +103,21 @@ vir_compute_temp_read_flags(struct v3d_compile *c)
         return flags;
 }
 
+/* The partial-update state of var in the given block, zeroed on first use
+ * in that block.
+ */
+static struct partial_update_state *
+get_partial_update(struct partial_update_state *partial_update,
+                   struct qblock *block, int var)
+{
+        struct partial_update_state *state = &partial_update[var];
+        if (state->block != block->index + 1) {
+                memset(state, 0, sizeof(*state));
+                state->block = block->index + 1;
+        }
+        return state;
+}
+
 static void
 vir_setup_use(struct v3d_compile *c, struct qblock *block, int ip,
               struct partial_update_state *partial_update_ht, struct qinst *inst,
@@ -123,7 +142,7 @@ vir_setup_use(struct v3d_compile *c, struct qblock *block, int ip,
                  */
                 if (BITSET_TEST(block->defout, var)) {
                         struct partial_update_state *state =
-                                &partial_update_ht[var];
+                                get_partial_update(partial_update_ht, block, var);
                         if (state->inst) {
                                 if (vir_get_cond(inst) == vir_get_cond(state->inst) &&
                                     flags_inst == state->flags_inst) {
@@ -196,7 +215,8 @@ vir_setup_def(struct v3d_compile *c, struct qblock *block, int ip,
          *      case the unwritten half is never read, so the pack write
          *      is an effective full definition for liveness purposes.
          */
-        struct partial_update_state *state = &partial_update[var];
+        struct partial_update_state *state =
+                get_partial_update(partial_update, block, var);
 
         if (is_unconditional) {
                 enum v3d_qpu_output_pack pack = vir_get_pack(inst);
@@ -264,9 +284,6 @@ vir_setup_def_use(struct v3d_compile *c)
 
         vir_for_each_block(block, c) {
                 block->start_ip = ip;
-
-                memset(partial_update, 0,
-                       sizeof(struct partial_update_state) * c->num_temps);
 
                 struct qinst *flags_inst = NULL;
 
@@ -389,20 +406,25 @@ vir_live_variables_defin_defout_dataflow(struct v3d_compile *c, int bitset_words
  * new information calculated from control flow.
  */
 static void
-vir_compute_start_end(struct v3d_compile *c, int num_vars)
+vir_compute_start_end(struct v3d_compile *c, int bitset_words)
 {
+        /* Only the variables set in both bitsets: a word at a time, as most
+         * of a big shader's temps are live in few of its blocks.
+         */
         vir_for_each_block(block, c) {
-                for (int i = 0; i < num_vars; i++) {
-                        if (BITSET_TEST(block->live_in, i) &&
-                            BITSET_TEST(block->defin, i)) {
+                for (int w = 0; w < bitset_words; w++) {
+                        BITSET_WORD in = block->live_in[w] & block->defin[w];
+                        while (in) {
+                                int i = w * BITSET_WORDBITS + u_bit_scan(&in);
                                 c->temp_start[i] = MIN2(c->temp_start[i],
                                                         block->start_ip);
                                 c->temp_end[i] = MAX2(c->temp_end[i],
                                                       block->start_ip);
                         }
 
-                        if (BITSET_TEST(block->live_out, i) &&
-                            BITSET_TEST(block->defout, i)) {
+                        BITSET_WORD out = block->live_out[w] & block->defout[w];
+                        while (out) {
+                                int i = w * BITSET_WORDBITS + u_bit_scan(&out);
                                 c->temp_start[i] = MIN2(c->temp_start[i],
                                                         block->end_ip);
                                 c->temp_end[i] = MAX2(c->temp_end[i],
@@ -423,15 +445,6 @@ vir_calculate_live_intervals(struct v3d_compile *c)
         if (c->temp_start) {
                 ralloc_free(c->temp_start);
                 ralloc_free(c->temp_end);
-
-                vir_for_each_block(block, c) {
-                        ralloc_free(block->def);
-                        ralloc_free(block->defin);
-                        ralloc_free(block->defout);
-                        ralloc_free(block->use);
-                        ralloc_free(block->live_in);
-                        ralloc_free(block->live_out);
-                }
         }
 
         c->temp_start = rzalloc_array(c, int, c->num_temps);
@@ -442,13 +455,30 @@ vir_calculate_live_intervals(struct v3d_compile *c)
                 c->temp_end[i] = -1;
         }
 
+        /* One allocation for all blocks' bitsets, kept for the next call: we
+         * are called again after each spill, and a fresh allocation every time
+         * (thousands of small ones, or one of megabytes that has to be paged
+         * in again) took more time than the analysis itself.
+         */
+        size_t num_blocks = 0;
+        vir_for_each_block(block, c)
+                num_blocks++;
+        size_t size = 6 * bitset_words * num_blocks;
+        if (size > c->live_bitsets_size) {
+                ralloc_free(c->live_bitsets);
+                c->live_bitsets = ralloc_array(c, BITSET_WORD, size);
+                c->live_bitsets_size = size;
+        }
+        memset(c->live_bitsets, 0, size * sizeof(BITSET_WORD));
+        BITSET_WORD *bitsets = c->live_bitsets;
         vir_for_each_block(block, c) {
-                block->def = rzalloc_array(c, BITSET_WORD, bitset_words);
-                block->defin = rzalloc_array(c, BITSET_WORD, bitset_words);
-                block->defout = rzalloc_array(c, BITSET_WORD, bitset_words);
-                block->use = rzalloc_array(c, BITSET_WORD, bitset_words);
-                block->live_in = rzalloc_array(c, BITSET_WORD, bitset_words);
-                block->live_out = rzalloc_array(c, BITSET_WORD, bitset_words);
+                block->def = bitsets;
+                block->defin = bitsets + bitset_words;
+                block->defout = bitsets + 2 * bitset_words;
+                block->use = bitsets + 3 * bitset_words;
+                block->live_in = bitsets + 4 * bitset_words;
+                block->live_out = bitsets + 5 * bitset_words;
+                bitsets += 6 * bitset_words;
         }
 
         vir_setup_def_use(c);
@@ -459,7 +489,7 @@ vir_calculate_live_intervals(struct v3d_compile *c)
         while (vir_live_variables_defin_defout_dataflow(c, bitset_words))
                 ;
 
-        vir_compute_start_end(c, c->num_temps);
+        vir_compute_start_end(c, bitset_words);
 
         c->live_intervals_valid = true;
 }

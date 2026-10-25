@@ -905,6 +905,12 @@ struct v3d_compile {
         /* Live ranges of temps. */
         int *temp_start, *temp_end;
         bool live_intervals_valid;
+        /* The blocks' liveness bitsets (def, defin, defout, use, live_in,
+         * live_out), in one allocation of live_bitsets_size words, reused by
+         * the next calculation.
+         */
+        BITSET_WORD *live_bitsets;
+        size_t live_bitsets_size;
 
         uint32_t *uniform_data;
         enum quniform_contents *uniform_contents;
