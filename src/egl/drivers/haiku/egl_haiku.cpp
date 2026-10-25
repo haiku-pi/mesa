@@ -95,18 +95,26 @@ struct imported_bitmap {
    uint32_t handle;
 };
 
+// A surface's bitmaps take turns: one on screen (the view's), one with the
+// presenter, one the GPU writes the next frame into. With a third, the render
+// thread never waits for the presenter before it hands the GPU the next frame.
+static const int kMaxBitmaps = 3;
+
 struct haiku_egl_surface {
    _EGLSurface base;
    struct hgl_buffer *fb;
    struct pipe_fence_handle *throttle_fence;
-   BBitmap *spare_bitmap; // hardware screens: the bitmap not on screen
-   struct imported_bitmap imported[2];
-      // the two bitmaps that alternate on screen
+   // hardware screens: the bitmaps neither on screen nor with the presenter
+   // (render thread only)
+   BBitmap *free_bitmaps[kMaxBitmaps];
+   int free_count;
+   int bitmap_count; // all of them, on screen and presenting included
+   struct imported_bitmap imported[kMaxBitmaps];
    bool no_import; // the driver cannot import them: copy
-   // The presenter thread (imported bitmaps): it waits for the GPU's blit of a
+   // The presenter thread (imported bitmaps): it waits for the GPU's copy of a
    // swap and hands the bitmap to the view, while the client renders the next
-   // frame. The render thread waits for it (presented_sem) only at the next
-   // swap, before it takes spare_bitmap again.
+   // frame. The render thread waits for it (presented_sem) before it hands it
+   // the next frame, or when it has no free bitmap.
    thread_id presenter; // 0: not started yet, < 0: none (hand over in place)
    sem_id present_sem;
    sem_id presented_sem;
@@ -115,12 +123,23 @@ struct haiku_egl_surface {
    struct pipe_screen *present_screen;
    BBitmap *pending_bitmap;
    struct imported_bitmap *pending_slot;
-   // HAIKU_EGL_FPS: frames presented since fps_start (us), printed every 5 s
+   BBitmap *returned_bitmap; // the presenter's: the one the view gave back
+   // HAIKU_EGL_FPS: frames presented since fps_start (us), printed every 5 s,
+   // with the render thread's waits for the presenter and the GPU
    uint32_t fps_frames;
    bigtime_t fps_start;
+   bigtime_t presenter_wait;
+   bigtime_t throttle_wait;
+};
+
+/* The next frame, as the render thread prepares it before it is presented. */
+struct haiku_present {
+   BBitmap *bitmap; // NULL: nothing to present
+   struct imported_bitmap *slot; // NULL: the CPU copies the frame
 };
 
 static void release_import(struct haiku_egl_surface *surface, BBitmap *bitmap);
+static void wait_presented(struct haiku_egl_surface *surface);
 
 /* A signal interrupts a semaphore wait (B_INTERRUPTED): the program's handler
  * runs on whichever thread took it, the presenter or the render thread. Neither
@@ -226,7 +245,7 @@ haiku_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
 
       if (hgl_surf->presenter > 0) {
          if (hgl_surf->presenting)
-            acquire_sem_uninterrupted(hgl_surf->presented_sem);
+            wait_presented(hgl_surf);
          hgl_surf->quit = true;
          release_sem(hgl_surf->present_sem);
          status_t result;
@@ -245,7 +264,8 @@ haiku_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
          if (hgl_dpy->hardware)
             delete shown;
       }
-      delete hgl_surf->spare_bitmap;
+      for (int i = 0; i < hgl_surf->free_count; i++)
+         delete hgl_surf->free_bitmaps[i];
 
       hgl_destroy_st_framebuffer(hgl_surf->fb);
       free(surf);
@@ -281,10 +301,78 @@ release_import(struct haiku_egl_surface *surface, BBitmap *bitmap)
    }
 }
 
+/* A bitmap is free again (render thread only). */
+static void
+put_free_bitmap(struct haiku_egl_surface *surface, BBitmap *bitmap)
+{
+   if (bitmap == NULL)
+      return;
+   if (surface->free_count < kMaxBitmaps) {
+      surface->free_bitmaps[surface->free_count++] = bitmap;
+      return;
+   }
+   release_import(surface, bitmap);
+   delete bitmap;
+   surface->bitmap_count--;
+}
+
+/* Waits until the presenter has handed its frame to the view, and takes back
+ * the bitmap the view gave up for it. */
+static void
+wait_presented(struct haiku_egl_surface *surface)
+{
+   acquire_sem_uninterrupted(surface->presented_sem);
+   surface->presenting = false;
+   put_free_bitmap(surface, surface->returned_bitmap);
+   surface->returned_bitmap = NULL;
+}
+
+/* A bitmap of width x height for the next frame: a free one, a new one while
+ * the surface has fewer than kMaxBitmaps, or the one the presenter gets back.
+ * NULL if none can be allocated. */
+static BBitmap *
+take_bitmap(struct haiku_egl_surface *surface, unsigned width, unsigned height)
+{
+   while (true) {
+      if (surface->free_count == 0) {
+         if (surface->presenting && surface->bitmap_count >= kMaxBitmaps) {
+            const bigtime_t start = system_time();
+            wait_presented(surface);
+            surface->presenter_wait += system_time() - start;
+            continue;
+         }
+         // B_RGB32 is B, G, R, X in memory: the visual's BGRX/BGRA8888 format
+         BBitmap *bitmap = new BBitmap(BRect(0, 0, width - 1, height - 1),
+                                       B_RGB32);
+         if (bitmap->InitCheck() != B_OK) {
+            delete bitmap;
+            return NULL;
+         }
+         surface->bitmap_count++;
+         return bitmap;
+      }
+
+      BBitmap *bitmap = surface->free_bitmaps[--surface->free_count];
+      if ((unsigned)bitmap->Bounds().IntegerWidth() + 1 == width
+          && (unsigned)bitmap->Bounds().IntegerHeight() + 1 == height)
+         return bitmap;
+      // the window was resized
+      release_import(surface, bitmap);
+      delete bitmap;
+      surface->bitmap_count--;
+   }
+}
+
 /*
  * The GPU copies the frame into the bitmap's own memory, which it imported
  * once: no CPU copy, no read of the GPU's write-combining memory. Returns
- * false when the bitmap cannot be imported (then the CPU copies).
+ * NULL when the bitmap cannot be imported (then the CPU copies).
+ *
+ * Nothing on the CPU writes the bitmap after it is imported (app_server only
+ * reads it), so its cache lines are written back and dropped once, then: a
+ * clean line is never written back over what the GPU wrote, and the presenter
+ * drops the stale ones after each copy. HAIKU_EGL_SYNC_EACH_FRAME=1 does it
+ * before every copy again, as before.
  */
 static struct imported_bitmap *
 haiku_present_gpu(struct pipe_context *pipe, struct pipe_resource *resource,
@@ -295,6 +383,8 @@ haiku_present_gpu(struct pipe_context *pipe, struct pipe_resource *resource,
    static const bool disabled = getenv("HAIKU_EGL_NO_IMPORT") != NULL;
    if (disabled)
       return NULL;
+   static const bool syncEachFrame
+      = getenv("HAIKU_EGL_SYNC_EACH_FRAME") != NULL;
 
    struct pipe_screen *screen = pipe->screen;
    struct imported_bitmap *slot = NULL;
@@ -302,9 +392,16 @@ haiku_present_gpu(struct pipe_context *pipe, struct pipe_resource *resource,
       if (import.resource != NULL && import.bitmap == bitmap)
          slot = &import;
    }
+   bool imported = false;
    if (slot == NULL) {
-      slot = &surface->imported[surface->imported[0].resource == NULL ? 0 : 1];
-      pipe_resource_reference(&slot->resource, NULL);
+      for (auto &import : surface->imported) {
+         if (import.resource == NULL) {
+            slot = &import;
+            break;
+         }
+      }
+      if (slot == NULL)
+         return NULL; // more bitmaps than slots: cannot happen
       slot->resource = haiku_hw_import_memory(screen, bitmap->Bits(),
          resource->width0, resource->height0, bitmap->BytesPerRow(),
          resource->format, &slot->handle);
@@ -314,10 +411,12 @@ haiku_present_gpu(struct pipe_context *pipe, struct pipe_resource *resource,
          return NULL;
       }
       slot->bitmap = bitmap;
+      imported = true;
    }
 
    // nothing the CPU cached of the bitmap may be written back over the frame
-   haiku_hw_sync_memory(screen, slot->handle);
+   if (imported || syncEachFrame)
+      haiku_hw_sync_memory(screen, slot->handle);
 
    struct pipe_blit_info blit;
    memset(&blit, 0, sizeof(blit));
@@ -330,9 +429,6 @@ haiku_present_gpu(struct pipe_context *pipe, struct pipe_resource *resource,
    blit.mask = PIPE_MASK_RGBA;
    blit.filter = PIPE_TEX_FILTER_NEAREST;
    pipe->blit(pipe, &blit);
-
-   // the presenter waits for it (the bitmap is the job's own buffer: no fence)
-   pipe->flush(pipe, NULL, 0);
    return slot;
 }
 
@@ -351,49 +447,49 @@ haiku_presenter(void *data)
           && !surface->quit) {
       haiku_hw_wait_memory(surface->present_screen, surface->pending_slot->handle);
       haiku_hw_sync_memory(surface->present_screen, surface->pending_slot->handle);
-      surface->spare_bitmap = hook->SetBitmap(surface->pending_bitmap);
+      surface->returned_bitmap = hook->SetBitmap(surface->pending_bitmap);
       release_sem(surface->presented_sem);
    }
    return B_OK;
 }
 
 /*
- * Hardware screens have no flush_frontbuffer: the frame is in GPU memory. Copy
- * it into a BBitmap and hand that to the view, which draws it (BitmapHook).
- * Two bitmaps alternate: the view returns the one it showed before.
+ * Hardware screens have no flush_frontbuffer: the frame is in GPU memory. It
+ * goes to the view in a BBitmap, which the view draws (BitmapHook).
+ *
+ * First half: takes a bitmap for the frame and has the GPU copy the frame
+ * into it. Called before the frame's rendering is flushed, the copy is a
+ * second store of the same render job (v3d's TLB blit), not a job of its own
+ * that loads the whole frame again: HAIKU_EGL_SEPARATE_BLIT=1 calls it after
+ * the flush, as before.
  */
+static struct haiku_present
+haiku_present_prepare(struct pipe_context *pipe, struct pipe_resource *resource,
+                      struct haiku_egl_surface *surface)
+{
+   struct haiku_present present = { NULL, NULL };
+   if (surface->fb->winsysContext == NULL)
+      return present; // a pbuffer
+
+   present.bitmap = take_bitmap(surface, resource->width0, resource->height0);
+   if (present.bitmap != NULL)
+      present.slot = haiku_present_gpu(pipe, resource, surface, present.bitmap);
+   return present;
+}
+
+/* Second half, after the flush: hands the frame to the presenter, or copies
+ * it with the CPU. */
 static void
-haiku_present_copy(struct pipe_context *pipe, struct pipe_resource *resource,
-                   struct haiku_egl_surface *surface)
+haiku_present_finish(struct pipe_context *pipe, struct pipe_resource *resource,
+                     struct haiku_egl_surface *surface,
+                     const struct haiku_present &present)
 {
    BitmapHook *hook = (BitmapHook *)surface->fb->winsysContext;
-   if (hook == NULL)
-      return; // a pbuffer
+   BBitmap *bitmap = present.bitmap;
+   if (bitmap == NULL)
+      return;
 
-   // the previous frame's bitmap is on screen and the one before is spare again
-   if (surface->presenting) {
-      acquire_sem_uninterrupted(surface->presented_sem);
-      surface->presenting = false;
-   }
-
-   const unsigned width = resource->width0;
-   const unsigned height = resource->height0;
-   BBitmap *bitmap = surface->spare_bitmap;
-   surface->spare_bitmap = NULL;
-   if (bitmap == NULL || (unsigned)bitmap->Bounds().IntegerWidth() + 1 != width
-       || (unsigned)bitmap->Bounds().IntegerHeight() + 1 != height) {
-      release_import(surface, bitmap);
-      delete bitmap;
-      // B_RGB32 is B, G, R, X in memory: the visual's BGRX/BGRA8888 format
-      bitmap = new BBitmap(BRect(0, 0, width - 1, height - 1), B_RGB32);
-      if (bitmap->InitCheck() != B_OK) {
-         delete bitmap;
-         return;
-      }
-   }
-
-   struct imported_bitmap *slot = haiku_present_gpu(pipe, resource, surface,
-                                                    bitmap);
+   struct imported_bitmap *slot = present.slot;
    if (slot != NULL && surface->presenter == 0) {
       surface->present_sem = create_sem(0, "egl present");
       surface->presented_sem = create_sem(0, "egl presented");
@@ -409,11 +505,19 @@ haiku_present_copy(struct pipe_context *pipe, struct pipe_resource *resource,
          surface->presenter = -1;
       }
    }
+
+   // the frames reach the view in order: the previous one first
+   if (surface->presenting) {
+      const bigtime_t start = system_time();
+      wait_presented(surface);
+      surface->presenter_wait += system_time() - start;
+   }
+
    if (slot != NULL && surface->presenter < 0) {
       // no presenter: hand the bitmap over here
       haiku_hw_wait_memory(pipe->screen, slot->handle);
       haiku_hw_sync_memory(pipe->screen, slot->handle);
-      surface->spare_bitmap = hook->SetBitmap(bitmap);
+      put_free_bitmap(surface, hook->SetBitmap(bitmap));
       return;
    }
    if (slot != NULL) {
@@ -425,25 +529,42 @@ haiku_present_copy(struct pipe_context *pipe, struct pipe_resource *resource,
    }
 
    struct pipe_box box;
-   u_box_2d(0, 0, width, height, &box);
+   u_box_2d(0, 0, resource->width0, resource->height0, &box);
    struct pipe_transfer *transfer;
    const uint8_t *source = (const uint8_t *)pipe->texture_map(pipe, resource,
       0, PIPE_MAP_READ, &box, &transfer);
    if (source == NULL) {
-      surface->spare_bitmap = bitmap;
+      put_free_bitmap(surface, bitmap);
       return;
    }
 
    uint8_t *target = (uint8_t *)bitmap->Bits();
    const size_t rowLength = std::min((size_t)bitmap->BytesPerRow(),
-      (size_t)width * 4);
-   for (unsigned y = 0; y < height; y++) {
+      (size_t)resource->width0 * 4);
+   for (unsigned y = 0; y < resource->height0; y++) {
       memcpy(target + y * bitmap->BytesPerRow(), source + y * transfer->stride,
          rowLength);
    }
    pipe->texture_unmap(pipe, transfer);
 
-   surface->spare_bitmap = hook->SetBitmap(bitmap);
+   put_free_bitmap(surface, hook->SetBitmap(bitmap));
+}
+
+struct haiku_present_args {
+   struct pipe_context *pipe;
+   struct pipe_resource *resource;
+   struct haiku_egl_surface *surface;
+   struct haiku_present present;
+};
+
+/* st_context_flush()'s callback: the frame is complete, its job not yet
+ * submitted. */
+static void
+haiku_present_before_flush(void *data)
+{
+   struct haiku_present_args *args = (struct haiku_present_args *)data;
+   args->present = haiku_present_prepare(args->pipe, args->resource,
+                                         args->surface);
 }
 
 static EGLBoolean
@@ -468,19 +589,37 @@ haiku_swap_buffers(_EGLDisplay *disp, _EGLSurface *surf)
 
    _mesa_glthread_finish(st->ctx);
 
+   // hardware screens: the GPU copies the frame into a bitmap as part of the
+   // frame's own job, before it is flushed
+   static const bool separateBlit = getenv("HAIKU_EGL_SEPARATE_BLIT") != NULL;
+   struct haiku_present_args args = { st->pipe, backBuffer, hgl_surf,
+                                      { NULL, NULL } };
+   const bool presentFirst = hgl_dpy->hardware && backBuffer != NULL
+      && !separateBlit;
+
    struct pipe_fence_handle *new_fence = NULL;
-   st_context_flush(st, ST_FLUSH_FRONT, &new_fence, NULL, NULL);
+   st_context_flush(st, ST_FLUSH_FRONT, &new_fence,
+                    presentFirst ? haiku_present_before_flush : NULL,
+                    presentFirst ? &args : NULL);
    if (hgl_surf->throttle_fence) {
+      const bigtime_t start = system_time();
       screen->fence_finish(screen, NULL, hgl_surf->throttle_fence,
                            OS_TIMEOUT_INFINITE);
       screen->fence_reference(screen, &hgl_surf->throttle_fence, NULL);
+      hgl_surf->throttle_wait += system_time() - start;
    }
    hgl_surf->throttle_fence = new_fence;
 
    // flush back buffer and swap buffers if double buffering is used
    if (backBuffer != NULL) {
       if (hgl_dpy->hardware) {
-         haiku_present_copy(st->pipe, backBuffer, hgl_surf);
+         if (!presentFirst) {
+            args.present = haiku_present_prepare(st->pipe, backBuffer,
+                                                 hgl_surf);
+            st->pipe->flush(st->pipe, NULL, 0);
+         }
+         haiku_present_finish(st->pipe, backBuffer, hgl_surf,
+                              args.present);
       } else {
          screen->flush_frontbuffer(screen, st->pipe, backBuffer, 0, 0,
                                    buffer->winsysContext, 1, NULL);
@@ -498,10 +637,15 @@ haiku_swap_buffers(_EGLDisplay *disp, _EGLSurface *surf)
          hgl_surf->fps_start = now;
       hgl_surf->fps_frames++;
       if (now - hgl_surf->fps_start >= 5000000) {
-         fprintf(stderr, "egl_haiku: %.1f frames/s\n",
-                 hgl_surf->fps_frames * 1e6 / (now - hgl_surf->fps_start));
+         fprintf(stderr, "egl_haiku: %.1f frames/s; per frame %.2f ms waiting "
+                 "for the GPU, %.2f ms for the presenter\n",
+                 hgl_surf->fps_frames * 1e6 / (now - hgl_surf->fps_start),
+                 hgl_surf->throttle_wait / 1e3 / hgl_surf->fps_frames,
+                 hgl_surf->presenter_wait / 1e3 / hgl_surf->fps_frames);
          hgl_surf->fps_frames = 0;
          hgl_surf->fps_start = now;
+         hgl_surf->throttle_wait = 0;
+         hgl_surf->presenter_wait = 0;
       }
    }
 
