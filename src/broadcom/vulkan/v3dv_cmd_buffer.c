@@ -443,6 +443,53 @@ job_compute_frame_tiling(struct v3dv_job *job,
    tiling->draw_tiles_x = DIV_ROUND_UP(width, tiling->tile_width);
    tiling->draw_tiles_y = DIV_ROUND_UP(height, tiling->tile_height);
 
+   /* The hardware renders every tile of each supertile it is given, so a
+    * supertile that is only partly inside the render area also stores the
+    * tiles outside it. When the render area is tile-aligned we skip loading
+    * them (tile_aligned_render_area), so those tiles would be overwritten with
+    * undefined contents. The frame ends at the render area's far edge, so this
+    * can only happen at its top-left corner: use the smallest supertiles that
+    * fit the limits and whose grid is aligned to that corner. If there are
+    * none, fall back to the plain sizing below.
+    */
+   const uint32_t origin_x_tiles =
+      tiling->origin_x % tiling->tile_width == 0 ?
+      tiling->origin_x / tiling->tile_width : 0;
+   const uint32_t origin_y_tiles =
+      tiling->origin_y % tiling->tile_height == 0 ?
+      tiling->origin_y / tiling->tile_height : 0;
+   if (origin_x_tiles != 0 || origin_y_tiles != 0) {
+      uint32_t best_w = 0, best_h = 0;
+      /* The supertile size fields are 8 bits wide. */
+      for (uint32_t h = 1; h <= MIN2(tiling->draw_tiles_y, 255); h++) {
+         if (origin_y_tiles % h != 0)
+            continue;
+         for (uint32_t w = 1; w <= MIN2(tiling->draw_tiles_x, 255); w++) {
+            if (origin_x_tiles % w != 0)
+               continue;
+            const uint32_t frame_w = DIV_ROUND_UP(tiling->draw_tiles_x, w);
+            const uint32_t frame_h = DIV_ROUND_UP(tiling->draw_tiles_y, h);
+            if (frame_w >= V3D_MAX_SUPERTILES ||
+                frame_h >= V3D_MAX_SUPERTILES ||
+                frame_w * frame_h > V3D_MAX_SUPERTILES) {
+               continue;
+            }
+            if (best_w == 0 || w * h < best_w * best_h)
+               best_w = w, best_h = h;
+            break;
+         }
+      }
+      if (best_w != 0) {
+         tiling->supertile_width = best_w;
+         tiling->supertile_height = best_h;
+         tiling->frame_width_in_supertiles =
+            DIV_ROUND_UP(tiling->draw_tiles_x, best_w);
+         tiling->frame_height_in_supertiles =
+            DIV_ROUND_UP(tiling->draw_tiles_y, best_h);
+         return tiling;
+      }
+   }
+
    /* Size up our supertiles until we get under the limit */
    tiling->supertile_width = 1;
    tiling->supertile_height = 1;
@@ -1796,6 +1843,8 @@ cmd_buffer_subpass_create_job(struct v3dv_cmd_buffer *cmd_buffer,
          state->render_area.offset.x + state->render_area.extent.width;
       uint32_t height =
          state->render_area.offset.y + state->render_area.extent.height;
+      job->frame_tiling.origin_x = state->render_area.offset.x;
+      job->frame_tiling.origin_y = state->render_area.offset.y;
 
       v3dv_job_start_frame(job,
                            width,
@@ -2790,6 +2839,8 @@ cmd_buffer_restart_job_for_msaa_if_needed(struct v3dv_cmd_buffer *cmd_buffer)
                  cmd_buffer->state.subpass_idx);
    cmd_buffer->state.job = job;
 
+   job->frame_tiling.origin_x = old_job->frame_tiling.origin_x;
+   job->frame_tiling.origin_y = old_job->frame_tiling.origin_y;
    v3dv_job_start_frame(job,
                         old_job->frame_tiling.width,
                         old_job->frame_tiling.height,

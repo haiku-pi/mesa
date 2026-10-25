@@ -125,6 +125,13 @@ struct v3dv_framebuffer {
 struct v3dv_frame_tiling {
    uint32_t width;
    uint32_t height;
+   /* Top-left corner of the render area (0 outside render passes): the frame
+    * ends at the render area's far edge, and the supertile grid is aligned to
+    * this corner when possible, so that no supertile is only partly inside the
+    * render area (see job_compute_frame_tiling).
+    */
+   uint32_t origin_x;
+   uint32_t origin_y;
    uint32_t layers;
    uint32_t render_target_count;
    uint32_t internal_bpp;
