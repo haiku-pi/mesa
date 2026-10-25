@@ -232,18 +232,34 @@ try_copy_prop(struct v3d_compile *c, struct qinst *inst, struct qinst **movs)
         return progress;
 }
 
+/* The MOVs available in the current block: movs[] by destination temp, and
+ * the list of temps that have one, so that a kill or the end of the block
+ * looks at those few rather than at every temp of the program (a big shader
+ * has thousands).
+ */
+struct available_movs {
+        struct qinst **movs;
+        uint32_t *temps;
+        uint32_t count;
+};
+
 static void
-apply_kills(struct v3d_compile *c, struct qinst **movs, struct qinst *inst)
+apply_kills(struct v3d_compile *c, struct available_movs *avail,
+            struct qinst *inst)
 {
         if (inst->dst.file != QFILE_TEMP)
                 return;
 
-        for (int i = 0; i < c->num_temps; i++) {
-                if (movs[i] &&
-                    (movs[i]->dst.index == inst->dst.index ||
-                     (movs[i]->src[0].file == QFILE_TEMP &&
-                      movs[i]->src[0].index == inst->dst.index))) {
-                        movs[i] = NULL;
+        for (uint32_t j = 0; j < avail->count;) {
+                uint32_t t = avail->temps[j];
+                struct qinst *mov = avail->movs[t];
+                if (mov->dst.index == inst->dst.index ||
+                    (mov->src[0].file == QFILE_TEMP &&
+                     mov->src[0].index == inst->dst.index)) {
+                        avail->movs[t] = NULL;
+                        avail->temps[j] = avail->temps[--avail->count];
+                } else {
+                        j++;
                 }
         }
 }
@@ -252,31 +268,38 @@ bool
 vir_opt_copy_propagate(struct v3d_compile *c)
 {
         bool progress = false;
-        struct qinst **movs;
-
-        movs = ralloc_array(c, struct qinst *, c->num_temps);
-        if (!movs)
+        struct available_movs avail = {
+                .movs = rzalloc_array(c, struct qinst *, c->num_temps),
+                .temps = ralloc_array(c, uint32_t, c->num_temps),
+        };
+        if (!avail.movs || !avail.temps)
                 return false;
 
         vir_for_each_block(block, c) {
                 /* The MOVs array tracks only available movs within the
                  * block.
                  */
-                memset(movs, 0, sizeof(struct qinst *) * c->num_temps);
+                for (uint32_t j = 0; j < avail.count; j++)
+                        avail.movs[avail.temps[j]] = NULL;
+                avail.count = 0;
 
                 c->cur_block = block;
                 vir_for_each_inst(inst, block) {
 
-                        progress = try_copy_prop(c, inst, movs) || progress;
+                        progress = try_copy_prop(c, inst, avail.movs) || progress;
 
-                        apply_kills(c, movs, inst);
+                        apply_kills(c, &avail, inst);
 
-                        if (is_copy_mov(c->devinfo, inst))
-                                movs[inst->dst.index] = inst;
+                        if (is_copy_mov(c->devinfo, inst)) {
+                                if (!avail.movs[inst->dst.index])
+                                        avail.temps[avail.count++] = inst->dst.index;
+                                avail.movs[inst->dst.index] = inst;
+                        }
                 }
         }
 
-        ralloc_free(movs);
+        ralloc_free(avail.movs);
+        ralloc_free(avail.temps);
 
         return progress;
 }
