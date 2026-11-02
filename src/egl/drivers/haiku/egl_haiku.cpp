@@ -55,7 +55,9 @@
 #include "hgl_context.h"
 #include "egl_haiku_hw.h"
 
+#include <Application.h>
 #include <Bitmap.h>
+#include <Screen.h>
 
 extern "C" {
 #include "target-helpers/inline_sw_helper.h"
@@ -93,12 +95,25 @@ struct imported_bitmap {
    BBitmap *bitmap;
    struct pipe_resource *resource;
    uint32_t handle;
+   // overlay bitmaps: their memory is a kernel area the client may access;
+   // the GPU imports a clone of it in our team (at the bitmap's Bits() then)
+   area_id clone;
+   void *bits;
 };
 
 // A surface's bitmaps take turns: one on screen (the view's), one with the
 // presenter, one the GPU writes the next frame into. With a third, the render
 // thread never waits for the presenter before it hands the GPU the next frame.
 static const int kMaxBitmaps = 3;
+
+/* Overlay bitmaps (B_BITMAP_WILL_OVERLAY) are scanned out by the display: a
+ * present flips the view's overlay to the next one. The firmware of the
+ * Raspberry Pi takes a plane change at an update point ~1.6 ms before the
+ * vertical blank (measured), so a bitmap replaced on screen at time T is no
+ * longer scanned out after a vertical blank that was waited for from
+ * T + kRetireGuard on (the retrace semaphore wakes its waiters at the blank).
+ * Only then may the GPU write it again. */
+static const bigtime_t kRetireGuard = 3000;
 
 struct haiku_egl_surface {
    _EGLSurface base;
@@ -124,6 +139,23 @@ struct haiku_egl_surface {
    BBitmap *pending_bitmap;
    struct imported_bitmap *pending_slot;
    BBitmap *returned_bitmap; // the presenter's: the one the view gave back
+   bigtime_t returned_time; // when it left the screen (0: it was not shown)
+   int swap_interval; // the frame's, for the presenter
+
+   // overlay bitmaps
+   bool overlay_refused; // not for this size: overlay_width x overlay_height
+   unsigned overlay_width, overlay_height;
+   int overlay_count;
+   BBitmap *retiring[kMaxBitmaps]; // off screen at a vertical blank after
+   bigtime_t retired_at[kMaxBitmaps]; // ... retired_at + kRetireGuard
+   int retiring_count;
+   int64 waited_from; // (atomic) a vertical blank was waited for from then on
+   BScreen *screen; // its retrace semaphore
+   // the presenter's flip statistics (HAIKU_EGL_FPS)
+   bigtime_t last_flip; // when the last flip returned
+   bigtime_t last_wake; // when the presenter woke for it (synchronized)
+   bigtime_t vblank_period;
+   uint32_t flips, missed, starved, late_flips, drops;
    // HAIKU_EGL_FPS: frames presented since fps_start (us), printed every 5 s,
    // with the render thread's waits for the presenter and the GPU
    uint32_t fps_frames;
@@ -153,6 +185,18 @@ acquire_sem_uninterrupted(sem_id sem)
       status = acquire_sem(sem);
    } while (status == B_INTERRUPTED);
    return status;
+}
+
+/* Whether a native window shows overlay bitmaps itself, on an overlay channel
+ * (BGLView's, libglvnd's libGL says): any other BitmapHook would draw them,
+ * reading the display's write-combining memory, so it gets none. */
+static bool
+native_window_shows_overlays(void *native_window)
+{
+   typedef bool (*shows_overlays_func)(const void *);
+   static const shows_overlays_func showsOverlays = (shows_overlays_func)
+      dlsym(RTLD_DEFAULT, "hgl_native_window_shows_overlays");
+   return showsOverlays != NULL && showsOverlays(native_window);
 }
 
 // #pragma mark EGLSurface
@@ -188,6 +232,22 @@ haiku_create_window_surface(_EGLDisplay *disp, _EGLConfig *conf,
 
    // Unset and delete previously set bitmap if any.
    delete ((BitmapHook *)native_window)->SetBitmap(NULL);
+
+   for (auto &import : wgl_surf->imported)
+      import.clone = -1;
+   wgl_surf->vblank_period = 16667;
+   if (hgl_dpy->hardware && be_app != NULL
+       && native_window_shows_overlays(native_window)) {
+      // for overlay frames: the screen's size and its retrace semaphore (the
+      // first wait asks app_server for it)
+      wgl_surf->screen = new BScreen(B_MAIN_SCREEN_ID);
+      if (wgl_surf->screen->IsValid())
+         wgl_surf->screen->WaitForRetrace(0);
+      else {
+         delete wgl_surf->screen;
+         wgl_surf->screen = NULL;
+      }
+   }
 
    return &wgl_surf->base;
 }
@@ -266,6 +326,9 @@ haiku_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
       }
       for (int i = 0; i < hgl_surf->free_count; i++)
          delete hgl_surf->free_bitmaps[i];
+      for (int i = 0; i < hgl_surf->retiring_count; i++)
+         delete hgl_surf->retiring[i];
+      delete hgl_surf->screen;
 
       hgl_destroy_st_framebuffer(hgl_surf->fb);
       free(surf);
@@ -288,17 +351,41 @@ update_size(struct hgl_buffer *buffer)
    }
 }
 
+static bool
+is_overlay(const BBitmap *bitmap)
+{
+   return bitmap != NULL && (bitmap->Flags() & B_BITMAP_WILL_OVERLAY) != 0;
+}
+
 /* Forgets a bitmap's import (before the bitmap goes: its memory stays wired
- * while the GPU may use it). */
+ * while the GPU may use it). An overlay buffer goes back to the display
+ * driver with its bitmap and may be handed to another client at once: the
+ * GPU is done with it first. */
 static void
 release_import(struct haiku_egl_surface *surface, BBitmap *bitmap)
 {
    for (auto &import : surface->imported) {
       if (import.resource != NULL && (bitmap == NULL || import.bitmap == bitmap)) {
+         if (import.clone > 0)
+            haiku_hw_wait_memory(import.resource->screen, import.handle);
          pipe_resource_reference(&import.resource, NULL);
+         if (import.clone > 0)
+            delete_area(import.clone);
+         import.clone = -1;
+         import.bits = NULL;
          import.bitmap = NULL;
       }
    }
+}
+
+static void
+delete_bitmap(struct haiku_egl_surface *surface, BBitmap *bitmap)
+{
+   release_import(surface, bitmap);
+   if (is_overlay(bitmap))
+      surface->overlay_count--;
+   delete bitmap;
+   surface->bitmap_count--;
 }
 
 /* A bitmap is free again (render thread only). */
@@ -311,9 +398,70 @@ put_free_bitmap(struct haiku_egl_surface *surface, BBitmap *bitmap)
       surface->free_bitmaps[surface->free_count++] = bitmap;
       return;
    }
-   release_import(surface, bitmap);
-   delete bitmap;
-   surface->bitmap_count--;
+   delete_bitmap(surface, bitmap);
+}
+
+/* A bitmap the view gave back (render thread only): free now, or, an overlay
+ * bitmap that left the screen at time left, once it is no longer scanned
+ * out. */
+static void
+put_returned_bitmap(struct haiku_egl_surface *surface, BBitmap *bitmap,
+                    bigtime_t left)
+{
+   if (bitmap == NULL)
+      return;
+   if (left == 0 || surface->retiring_count == kMaxBitmaps) {
+      put_free_bitmap(surface, bitmap);
+      return;
+   }
+   surface->retiring[surface->retiring_count] = bitmap;
+   surface->retired_at[surface->retiring_count++] = left;
+}
+
+/* Moves the retiring bitmaps that are off screen to the free ones. */
+static void
+collect_retired(struct haiku_egl_surface *surface)
+{
+   const bigtime_t waitedFrom = atomic_get64(&surface->waited_from);
+   for (int i = 0; i < surface->retiring_count;) {
+      if (surface->retired_at[i] + kRetireGuard <= waitedFrom) {
+         put_free_bitmap(surface, surface->retiring[i]);
+         surface->retiring_count--;
+         surface->retiring[i] = surface->retiring[surface->retiring_count];
+         surface->retired_at[i] = surface->retired_at[surface->retiring_count];
+      } else
+         i++;
+   }
+}
+
+/* Waits for the next vertical blank, from time from on; returns when it woke.
+ * Both threads may wait: whoever does advances waited_from. */
+static bigtime_t
+wait_vblank(struct haiku_egl_surface *surface, bigtime_t from)
+{
+   if (system_time() < from)
+      snooze_until(from, B_SYSTEM_TIMEBASE);
+   const bigtime_t start = system_time();
+   status_t status = B_ERROR;
+   if (surface->screen != NULL) {
+      do {
+         status = surface->screen->WaitForRetrace(100000);
+      } while (status == B_INTERRUPTED);
+   }
+   if (status != B_OK) {
+      // no retrace semaphore, or it stopped: a frame's time holds a blank
+      snooze_until(start + 20000, B_SYSTEM_TIMEBASE);
+   }
+
+   int64 old = atomic_get64(&surface->waited_from);
+   while (old < start) {
+      const int64 previous = atomic_test_and_set64(&surface->waited_from,
+                                                   start, old);
+      if (previous == old)
+         break;
+      old = previous;
+   }
+   return system_time();
 }
 
 /* Waits until the presenter has handed its frame to the view, and takes back
@@ -323,43 +471,102 @@ wait_presented(struct haiku_egl_surface *surface)
 {
    acquire_sem_uninterrupted(surface->presented_sem);
    surface->presenting = false;
-   put_free_bitmap(surface, surface->returned_bitmap);
+   put_returned_bitmap(surface, surface->returned_bitmap,
+                       surface->returned_time);
    surface->returned_bitmap = NULL;
 }
 
-/* A bitmap of width x height for the next frame: a free one, a new one while
- * the surface has fewer than kMaxBitmaps, or the one the presenter gets back.
- * NULL if none can be allocated. */
-static BBitmap *
-take_bitmap(struct haiku_egl_surface *surface, unsigned width, unsigned height)
+/* Whether frames of width x height go to overlay bitmaps (scanned out, no
+ * copy): HAIKU_EGL_OVERLAY=0 never, =1 always, by default when they cover the
+ * screen. Decided again when the size changes. */
+static bool
+want_overlay(struct haiku_egl_surface *surface, unsigned width,
+             unsigned height)
 {
-   while (true) {
-      if (surface->free_count == 0) {
-         if (surface->presenting && surface->bitmap_count >= kMaxBitmaps) {
-            const bigtime_t start = system_time();
-            wait_presented(surface);
-            surface->presenter_wait += system_time() - start;
-            continue;
-         }
-         // B_RGB32 is B, G, R, X in memory: the visual's BGRX/BGRA8888 format
-         BBitmap *bitmap = new BBitmap(BRect(0, 0, width - 1, height - 1),
-                                       B_RGB32);
-         if (bitmap->InitCheck() != B_OK) {
-            delete bitmap;
-            return NULL;
-         }
+   static const char *mode = getenv("HAIKU_EGL_OVERLAY");
+   if (surface->screen == NULL || surface->no_import
+       || (mode != NULL && strcmp(mode, "0") == 0))
+      return false;
+   if (surface->overlay_refused && width == surface->overlay_width
+       && height == surface->overlay_height)
+      return false;
+   if (width != surface->overlay_width || height != surface->overlay_height) {
+      surface->overlay_width = width;
+      surface->overlay_height = height;
+      BRect frame = surface->screen->Frame();
+      surface->overlay_refused = !(mode != NULL && strcmp(mode, "1") == 0)
+         && (width != (unsigned)frame.IntegerWidth() + 1
+             || height != (unsigned)frame.IntegerHeight() + 1);
+   }
+   return !surface->overlay_refused;
+}
+
+/* A new bitmap for a frame: an overlay bitmap if wanted and one can be had
+ * (the first takes the view's overlay channel), else an ordinary one. */
+static BBitmap *
+new_bitmap(struct haiku_egl_surface *surface, unsigned width, unsigned height,
+           bool overlay)
+{
+   const BRect bounds(0, 0, width - 1, height - 1);
+   if (overlay) {
+      uint32 flags = B_BITMAP_WILL_OVERLAY;
+      if (surface->overlay_count == 0)
+         flags |= B_BITMAP_RESERVE_OVERLAY_CHANNEL;
+      BBitmap *bitmap = new BBitmap(bounds, flags, B_RGB32);
+      if (bitmap->InitCheck() == B_OK && bitmap->Bits() != NULL) {
+         surface->overlay_count++;
          surface->bitmap_count++;
          return bitmap;
       }
-
-      BBitmap *bitmap = surface->free_bitmaps[--surface->free_count];
-      if ((unsigned)bitmap->Bounds().IntegerWidth() + 1 == width
-          && (unsigned)bitmap->Bounds().IntegerHeight() + 1 == height)
-         return bitmap;
-      // the window was resized
-      release_import(surface, bitmap);
       delete bitmap;
-      surface->bitmap_count--;
+      surface->overlay_refused = true;
+      ERROR("no overlay for %ux%u frames: presenting through the window\n",
+            width, height);
+   }
+
+   // B_RGB32 is B, G, R, X in memory: the visual's BGRX/BGRA8888 format
+   BBitmap *bitmap = new BBitmap(bounds, B_RGB32);
+   if (bitmap->InitCheck() != B_OK) {
+      delete bitmap;
+      return NULL;
+   }
+   surface->bitmap_count++;
+   return bitmap;
+}
+
+/* A bitmap of width x height for the next frame: a free one, a new one while
+ * the surface has fewer than kMaxBitmaps, the one the presenter gets back, or
+ * a retiring one once it is off screen. NULL if none can be allocated. */
+static BBitmap *
+take_bitmap(struct haiku_egl_surface *surface, unsigned width, unsigned height)
+{
+   const bool overlay = want_overlay(surface, width, height);
+   while (true) {
+      collect_retired(surface);
+      if (surface->free_count > 0) {
+         BBitmap *bitmap = surface->free_bitmaps[--surface->free_count];
+         if ((unsigned)bitmap->Bounds().IntegerWidth() + 1 == width
+             && (unsigned)bitmap->Bounds().IntegerHeight() + 1 == height
+             && is_overlay(bitmap) == overlay)
+            return bitmap;
+         // the window was resized, or overlays came or went
+         delete_bitmap(surface, bitmap);
+         continue;
+      }
+      if (surface->bitmap_count < kMaxBitmaps)
+         return new_bitmap(surface, width, height, overlay);
+
+      const bigtime_t start = system_time();
+      if (surface->presenting)
+         wait_presented(surface);
+      else if (surface->retiring_count > 0) {
+         bigtime_t oldest = surface->retired_at[0];
+         for (int i = 1; i < surface->retiring_count; i++)
+            oldest = std::min(oldest, surface->retired_at[i]);
+         wait_vblank(surface, oldest + kRetireGuard);
+      } else
+         return NULL; // all bitmaps on screen: cannot happen
+      surface->presenter_wait += system_time() - start;
    }
 }
 
@@ -372,7 +579,12 @@ take_bitmap(struct haiku_egl_surface *surface, unsigned width, unsigned height)
  * reads it), so its cache lines are written back and dropped once, then: a
  * clean line is never written back over what the GPU wrote, and the presenter
  * drops the stale ones after each copy. HAIKU_EGL_SYNC_EACH_FRAME=1 does it
- * before every copy again, as before.
+ * before every copy again, as before. Overlay bitmaps are write-combining
+ * everywhere: no cache to maintain.
+ *
+ * An overlay bitmap's memory is a kernel area every team may access; the GPU
+ * imports a clone of it in our team. The display driver may move it (a mode
+ * change suspends overlays): a new Bits() is imported again.
  */
 static struct imported_bitmap *
 haiku_present_gpu(struct pipe_context *pipe, struct pipe_resource *resource,
@@ -386,11 +598,21 @@ haiku_present_gpu(struct pipe_context *pipe, struct pipe_resource *resource,
    static const bool syncEachFrame
       = getenv("HAIKU_EGL_SYNC_EACH_FRAME") != NULL;
 
+   const bool overlay = is_overlay(bitmap);
+   void *bits = bitmap->Bits();
+   if (bits == NULL)
+      return NULL;
+
    struct pipe_screen *screen = pipe->screen;
    struct imported_bitmap *slot = NULL;
    for (auto &import : surface->imported) {
       if (import.resource != NULL && import.bitmap == bitmap)
          slot = &import;
+   }
+   if (slot != NULL && overlay && slot->bits != bits) {
+      // the overlay buffer moved
+      release_import(surface, bitmap);
+      slot = NULL;
    }
    bool imported = false;
    if (slot == NULL) {
@@ -402,20 +624,45 @@ haiku_present_gpu(struct pipe_context *pipe, struct pipe_resource *resource,
       }
       if (slot == NULL)
          return NULL; // more bitmaps than slots: cannot happen
-      slot->resource = haiku_hw_import_memory(screen, bitmap->Bits(),
+
+      void *address = bits;
+      area_id clone = -1;
+      if (overlay) {
+         area_info info;
+         const area_id area = area_for(bits);
+         if (area < 0 || get_area_info(area, &info) != B_OK)
+            return NULL;
+         void *cloneAddress;
+         clone = clone_area("egl overlay bitmap", &cloneAddress, B_ANY_ADDRESS,
+                            B_READ_AREA, area);
+         if (clone < 0)
+            return NULL;
+         address = (uint8_t *)cloneAddress
+            + ((uint8_t *)bits - (uint8_t *)info.address);
+      }
+
+      slot->resource = haiku_hw_import_memory(screen, address,
          resource->width0, resource->height0, bitmap->BytesPerRow(),
          resource->format, &slot->handle);
       if (slot->resource == NULL) {
+         if (clone >= 0)
+            delete_area(clone);
+         if (overlay) {
+            ERROR("cannot import an overlay bitmap: copying into it\n");
+            return NULL;
+         }
          ERROR("cannot import the window's bitmap: presenting by copying\n");
          surface->no_import = true;
          return NULL;
       }
       slot->bitmap = bitmap;
+      slot->clone = clone;
+      slot->bits = bits;
       imported = true;
    }
 
    // nothing the CPU cached of the bitmap may be written back over the frame
-   if (imported || syncEachFrame)
+   if (!overlay && (imported || syncEachFrame))
       haiku_hw_sync_memory(screen, slot->handle);
 
    struct pipe_blit_info blit;
@@ -432,11 +679,44 @@ haiku_present_gpu(struct pipe_context *pipe, struct pipe_resource *resource,
    return slot;
 }
 
+/*
+ * Synchronized overlay frames (swap interval 1): the flip goes right after a
+ * vertical blank, a frame before the firmware's next update point. The wait
+ * starts no earlier than kRetireGuard after the last flip, so the bitmap that
+ * flip replaced is off screen once it returns. Counts the blanks between
+ * flips: one is on time; more than the frame needed (it was ready in time)
+ * are missed flips, the others the GPU's (starved).
+ */
+static void
+wait_flip_slot(struct haiku_egl_surface *surface, bigtime_t ready)
+{
+   const bigtime_t from = surface->last_flip + kRetireGuard;
+   const bigtime_t wake = wait_vblank(surface, from);
+   if (surface->last_wake != 0) {
+      const bigtime_t period = surface->vblank_period;
+      const bigtime_t interval = wake - surface->last_wake;
+      const int64 blanks = std::max<int64>((interval + period / 2) / period, 1);
+      if (blanks == 1)
+         surface->vblank_period = (period * 15 + interval) / 16;
+      // the first blank the frame could have used
+      const bigtime_t earliest = std::max(ready, from);
+      int64 needed = 1;
+      while (surface->last_wake + needed * period - period / 4 < earliest)
+         needed++;
+      if (blanks > needed)
+         surface->missed += blanks - needed;
+      if (needed > 1)
+         surface->starved += std::min(blanks, needed) - 1;
+   }
+   surface->last_wake = wake;
+}
 
 /*
  * The presenter thread: hands each blitted bitmap to the view once the GPU is
  * done with it, after dropping the CPU's stale cache lines (app_server reads
- * it next).
+ * it next). An overlay bitmap is flipped onto the screen, at the next
+ * vertical blank with swap interval 1; the bitmap it replaces is returned
+ * with the time it left the screen.
  */
 static status_t
 haiku_presenter(void *data)
@@ -445,17 +725,60 @@ haiku_presenter(void *data)
    BitmapHook *hook = (BitmapHook *)surface->fb->winsysContext;
    while (acquire_sem_uninterrupted(surface->present_sem) == B_OK
           && !surface->quit) {
+      BBitmap *bitmap = surface->pending_bitmap;
       haiku_hw_wait_memory(surface->present_screen, surface->pending_slot->handle);
-      haiku_hw_sync_memory(surface->present_screen, surface->pending_slot->handle);
-      surface->returned_bitmap = hook->SetBitmap(surface->pending_bitmap);
+      if (!is_overlay(bitmap)) {
+         haiku_hw_sync_memory(surface->present_screen,
+                              surface->pending_slot->handle);
+         surface->returned_bitmap = hook->SetBitmap(bitmap);
+         surface->returned_time = 0;
+         release_sem(surface->presented_sem);
+         continue;
+      }
+
+      const bigtime_t ready = system_time();
+      if (surface->swap_interval > 0)
+         wait_flip_slot(surface, ready);
+      BBitmap *old = hook->SetBitmap(bitmap);
+      const bigtime_t now = system_time();
+      if (old == bitmap) {
+         // not shown (the window was busy): free again
+         surface->drops++;
+         surface->returned_time = 0;
+      } else {
+         surface->flips++;
+         if (surface->swap_interval > 0
+             && now - surface->last_wake > surface->vblank_period - kRetireGuard)
+            surface->late_flips++;
+         surface->last_flip = now;
+         surface->returned_time = is_overlay(old) ? now : 0;
+      }
+      surface->returned_bitmap = old;
       release_sem(surface->presented_sem);
    }
    return B_OK;
 }
 
+/* Hands a bitmap to the view from the render thread (no presenter). */
+static void
+hand_to_view(struct haiku_egl_surface *surface, BitmapHook *hook,
+             BBitmap *bitmap)
+{
+   BBitmap *old = hook->SetBitmap(bitmap);
+   if (old == bitmap) {
+      surface->drops++;
+      put_free_bitmap(surface, bitmap);
+      return;
+   }
+   if (is_overlay(bitmap))
+      surface->flips++;
+   put_returned_bitmap(surface, old, is_overlay(old) ? system_time() : 0);
+}
+
 /*
  * Hardware screens have no flush_frontbuffer: the frame is in GPU memory. It
- * goes to the view in a BBitmap, which the view draws (BitmapHook).
+ * goes to the view in a BBitmap, which the view draws (BitmapHook), or shows
+ * on an overlay (an overlay bitmap).
  *
  * First half: takes a bitmap for the frame and has the GPU copy the frame
  * into it. Called before the frame's rendering is flushed, the copy is a
@@ -516,8 +839,9 @@ haiku_present_finish(struct pipe_context *pipe, struct pipe_resource *resource,
    if (slot != NULL && surface->presenter < 0) {
       // no presenter: hand the bitmap over here
       haiku_hw_wait_memory(pipe->screen, slot->handle);
-      haiku_hw_sync_memory(pipe->screen, slot->handle);
-      put_free_bitmap(surface, hook->SetBitmap(bitmap));
+      if (!is_overlay(bitmap))
+         haiku_hw_sync_memory(pipe->screen, slot->handle);
+      hand_to_view(surface, hook, bitmap);
       return;
    }
    if (slot != NULL) {
@@ -525,6 +849,13 @@ haiku_present_finish(struct pipe_context *pipe, struct pipe_resource *resource,
       surface->pending_slot = slot;
       surface->presenting = true;
       release_sem(surface->present_sem);
+      return;
+   }
+
+   uint8_t *target = (uint8_t *)bitmap->Bits();
+   if (target == NULL) {
+      // an overlay bitmap whose buffer is suspended (a mode change)
+      put_free_bitmap(surface, bitmap);
       return;
    }
 
@@ -538,7 +869,6 @@ haiku_present_finish(struct pipe_context *pipe, struct pipe_resource *resource,
       return;
    }
 
-   uint8_t *target = (uint8_t *)bitmap->Bits();
    const size_t rowLength = std::min((size_t)bitmap->BytesPerRow(),
       (size_t)resource->width0 * 4);
    for (unsigned y = 0; y < resource->height0; y++) {
@@ -547,7 +877,7 @@ haiku_present_finish(struct pipe_context *pipe, struct pipe_resource *resource,
    }
    pipe->texture_unmap(pipe, transfer);
 
-   put_free_bitmap(surface, hook->SetBitmap(bitmap));
+   hand_to_view(surface, hook, bitmap);
 }
 
 struct haiku_present_args {
@@ -613,6 +943,7 @@ haiku_swap_buffers(_EGLDisplay *disp, _EGLSurface *surf)
    // flush back buffer and swap buffers if double buffering is used
    if (backBuffer != NULL) {
       if (hgl_dpy->hardware) {
+         hgl_surf->swap_interval = surf->SwapInterval;
          if (!presentFirst) {
             args.present = haiku_present_prepare(st->pipe, backBuffer,
                                                  hgl_surf);
@@ -642,6 +973,16 @@ haiku_swap_buffers(_EGLDisplay *disp, _EGLSurface *surf)
                  hgl_surf->fps_frames * 1e6 / (now - hgl_surf->fps_start),
                  hgl_surf->throttle_wait / 1e3 / hgl_surf->fps_frames,
                  hgl_surf->presenter_wait / 1e3 / hgl_surf->fps_frames);
+         if (hgl_surf->flips + hgl_surf->drops > 0) {
+            // (the presenter's counts: read without its lock, for a report)
+            fprintf(stderr, "egl_haiku: overlay: %u flips, %u missed, %u "
+                    "starved, %u late, %u dropped (swap interval %d, "
+                    "vblank %.3f ms)\n", hgl_surf->flips, hgl_surf->missed,
+                    hgl_surf->starved, hgl_surf->late_flips, hgl_surf->drops,
+                    surf->SwapInterval, hgl_surf->vblank_period / 1e3);
+            hgl_surf->flips = hgl_surf->missed = hgl_surf->starved = 0;
+            hgl_surf->late_flips = hgl_surf->drops = 0;
+         }
          hgl_surf->fps_frames = 0;
          hgl_surf->fps_start = now;
          hgl_surf->throttle_wait = 0;
@@ -697,6 +1038,9 @@ haiku_add_configs_for_visuals(_EGLDisplay *disp)
    conf->base.MaxPbufferHeight = _EGL_MAX_PBUFFER_HEIGHT;
    conf->base.MaxPbufferPixels = 0; // TODO: How to get the right value ?
    conf->base.SurfaceType = EGL_WINDOW_BIT | EGL_PIXMAP_BIT | EGL_PBUFFER_BIT;
+   // overlay frames wait for the vertical blank with 1 (EGL's default)
+   conf->base.MinSwapInterval = 0;
+   conf->base.MaxSwapInterval = 1;
 
    TRACE("Config configuated\n");
    if (!_eglValidateConfig(&conf->base, EGL_FALSE)) {
