@@ -973,13 +973,13 @@ cache_hash(const void *_key, uint32_t key_size)
 {
         const struct v3d_cache_key *key = (struct v3d_cache_key *) _key;
 
-        blake3_hasher ctx;
-        unsigned char blake3[BLAKE3_KEY_LEN];
-        _mesa_blake3_init(&ctx);
-        _mesa_blake3_update(&ctx, key->key, key_size);
-        _mesa_blake3_update(&ctx, key->blake3, BLAKE3_KEY_LEN);
-        _mesa_blake3_final(&ctx, blake3);
-        return _mesa_hash_data(blake3, BLAKE3_KEY_LEN);
+        /* The hash table only needs a well-mixed 32-bit value: key->blake3 is
+         * already a digest of the shader, so hash it and the variant key with
+         * the table's own hash instead of a BLAKE3 at every lookup (a variant
+         * lookup runs at every draw that changes state).
+         */
+        uint32_t hash = _mesa_hash_data(key->blake3, BLAKE3_KEY_LEN);
+        return _mesa_hash_data_with_seed(key->key, key_size, hash);
 }
 
 static inline bool
