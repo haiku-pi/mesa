@@ -168,7 +168,14 @@ struct haiku_egl_surface {
    bigtime_t retired_at[kMaxBitmaps]; // ... retired_at + kRetireGuard
    int retiring_count;
    int64 waited_from; // (atomic) a vertical blank was waited for from then on
-   BScreen *screen; // its retrace semaphore
+   BScreen *screen; // its retrace semaphore (hardware screens)
+   bool shows_overlays; // the native window shows overlay bitmaps (BGLView)
+   // windowed frames with swap interval >= 1: one per vertical blank (render
+   // thread)
+   bigtime_t pace_wake; // the last blank the render thread woke for
+   bigtime_t pace_frame; // when the last windowed frame was handed over
+   bigtime_t pace_period;
+   uint32_t paced, pace_skips; // (HAIKU_EGL_FPS) frames that waited, did not
    // the presenter's flip statistics (HAIKU_EGL_FPS)
    bigtime_t last_flip; // when the last flip returned
    bigtime_t last_wake; // when the presenter woke for it (synchronized)
@@ -255,12 +262,13 @@ haiku_create_window_surface(_EGLDisplay *disp, _EGLConfig *conf,
    for (auto &import : wgl_surf->imported)
       import.clone = -1;
    wgl_surf->vblank_period = 16667;
+   wgl_surf->pace_period = 16667;
    pthread_mutex_init(&wgl_surf->mailbox_lock, NULL);
    wgl_surf->mailbox_returned_sem = -1;
-   if (hgl_dpy->hardware && be_app != NULL
-       && native_window_shows_overlays(native_window)) {
-      // for overlay frames: the screen's size and its retrace semaphore (the
-      // first wait asks app_server for it)
+   if (hgl_dpy->hardware && be_app != NULL) {
+      // the screen's retrace semaphore (the first wait asks app_server for
+      // it) for vsynced frames, and its size for overlay frames
+      wgl_surf->shows_overlays = native_window_shows_overlays(native_window);
       wgl_surf->screen = new BScreen(B_MAIN_SCREEN_ID);
       if (wgl_surf->screen->IsValid())
          wgl_surf->screen->WaitForRetrace(0);
@@ -523,7 +531,7 @@ want_overlay(struct haiku_egl_surface *surface, unsigned width,
              unsigned height)
 {
    static const char *mode = getenv("HAIKU_EGL_OVERLAY");
-   if (surface->screen == NULL || surface->no_import
+   if (surface->screen == NULL || !surface->shows_overlays || surface->no_import
        || (mode != NULL && strcmp(mode, "0") == 0))
       return false;
    if (surface->overlay_refused && width == surface->overlay_width
@@ -856,6 +864,57 @@ haiku_presenter(void *data)
    return B_OK;
 }
 
+/*
+ * Windowed frames (no overlay) with swap interval 1: at most one per vertical
+ * blank. app_server copies a window's frame when it arrives, not at a blank,
+ * so a wait before the present would only show it later: the render thread
+ * waits after it handed the frame over instead, and the program starts the
+ * next frame right after a blank. A frame that took longer than a refresh is
+ * not held back for another blank: no wait when one went by since the last
+ * frame (predicted from the blanks woken for before).
+ */
+static void
+pace_window(struct haiku_egl_surface *surface)
+{
+   const bigtime_t period = surface->pace_period;
+   const bigtime_t now = system_time();
+   if (surface->pace_wake != 0) {
+      const bigtime_t next = surface->pace_wake
+         + ((surface->pace_frame - surface->pace_wake) / period + 1) * period;
+      if (now + period / 32 >= next) {
+         surface->pace_frame = now;
+         surface->pace_skips++;
+         return;
+      }
+   }
+
+   status_t status = B_ERROR;
+   if (surface->screen != NULL) {
+      do {
+         status = surface->screen->WaitForRetrace(2 * period);
+      } while (status == B_INTERRUPTED);
+   }
+   if (status != B_OK && surface->pace_wake != 0) {
+      // no retrace semaphore, or no blanks (the display is off): a timer
+      const bigtime_t next = surface->pace_wake
+         + ((now - surface->pace_wake) / period + 1) * period;
+      snooze_until(next, B_SYSTEM_TIMEBASE);
+   }
+   const bigtime_t wake = system_time();
+
+   if (status == B_OK && surface->pace_wake != 0) {
+      // the refresh period, from consecutive blanks
+      const bigtime_t interval = wake - surface->pace_wake;
+      if (interval > period / 2 && interval < period * 3 / 2) {
+         surface->pace_period = std::clamp<bigtime_t>(
+            (period * 15 + interval) / 16, 4000, 50000);
+      }
+   }
+   surface->pace_wake = wake;
+   surface->pace_frame = wake;
+   surface->paced++;
+}
+
 /* Hands a bitmap to the view from the render thread (no presenter). */
 static void
 hand_to_view(struct haiku_egl_surface *surface, BitmapHook *hook,
@@ -1036,8 +1095,11 @@ haiku_swap_buffers(_EGLDisplay *disp, _EGLSurface *surf)
 
    _mesa_glthread_finish(st->ctx);
 
-   // (take_bitmap() and the present need it)
-   hgl_surf->swap_interval = surf->SwapInterval;
+   // (take_bitmap() and the present need it); HAIKU_EGL_SWAP_INTERVAL=0 or 1
+   // replaces the program's
+   static const char *intervalOverride = getenv("HAIKU_EGL_SWAP_INTERVAL");
+   hgl_surf->swap_interval = intervalOverride != NULL
+      ? std::clamp(atoi(intervalOverride), 0, 1) : surf->SwapInterval;
 
    // hardware screens: the GPU copies the frame into a bitmap as part of the
    // frame's own job, before it is flushed
@@ -1068,8 +1130,12 @@ haiku_swap_buffers(_EGLDisplay *disp, _EGLSurface *surf)
                                                  hgl_surf);
             st->pipe->flush(st->pipe, NULL, 0);
          }
+         const bool windowed = args.present.bitmap != NULL
+            && !is_overlay(args.present.bitmap);
          haiku_present_finish(st->pipe, backBuffer, hgl_surf,
                               args.present);
+         if (windowed && hgl_surf->swap_interval > 0)
+            pace_window(hgl_surf);
       } else {
          screen->flush_frontbuffer(screen, st->pipe, backBuffer, 0, 0,
                                    buffer->winsysContext, 1, NULL);
@@ -1092,13 +1158,21 @@ haiku_swap_buffers(_EGLDisplay *disp, _EGLSurface *surf)
                  hgl_surf->fps_frames * 1e6 / (now - hgl_surf->fps_start),
                  hgl_surf->throttle_wait / 1e3 / hgl_surf->fps_frames,
                  hgl_surf->presenter_wait / 1e3 / hgl_surf->fps_frames);
+         if (hgl_surf->paced + hgl_surf->pace_skips > 0) {
+            fprintf(stderr, "egl_haiku: window: %u frames waited for a "
+                    "vertical blank, %u went late (swap interval %d, vblank "
+                    "%.3f ms)\n", hgl_surf->paced, hgl_surf->pace_skips,
+                    hgl_surf->swap_interval, hgl_surf->pace_period / 1e3);
+            hgl_surf->paced = hgl_surf->pace_skips = 0;
+         }
          if (hgl_surf->flips + hgl_surf->drops + hgl_surf->superseded > 0) {
             // (the presenter's counts: read without its lock, for a report)
             fprintf(stderr, "egl_haiku: overlay: %u flips, %u missed, %u "
                     "starved, %u late, %u dropped, %u superseded (swap "
                     "interval %d, vblank %.3f ms)\n", hgl_surf->flips,
                     hgl_surf->missed, hgl_surf->starved, hgl_surf->late_flips,
-                    hgl_surf->drops, hgl_surf->superseded, surf->SwapInterval,
+                    hgl_surf->drops, hgl_surf->superseded,
+                    hgl_surf->swap_interval,
                     hgl_surf->vblank_period / 1e3);
             hgl_surf->flips = hgl_surf->missed = hgl_surf->starved = 0;
             hgl_surf->late_flips = hgl_surf->drops = 0;
@@ -1159,7 +1233,7 @@ haiku_add_configs_for_visuals(_EGLDisplay *disp)
    conf->base.MaxPbufferHeight = _EGL_MAX_PBUFFER_HEIGHT;
    conf->base.MaxPbufferPixels = 0; // TODO: How to get the right value ?
    conf->base.SurfaceType = EGL_WINDOW_BIT | EGL_PIXMAP_BIT | EGL_PBUFFER_BIT;
-   // overlay frames wait for the vertical blank with 1 (EGL's default)
+   // 1 (EGL's default): one frame per vertical blank, windowed or overlay
    conf->base.MinSwapInterval = 0;
    conf->base.MaxSwapInterval = 1;
 
