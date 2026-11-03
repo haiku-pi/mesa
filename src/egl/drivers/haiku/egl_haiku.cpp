@@ -24,6 +24,7 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,7 +105,12 @@ struct imported_bitmap {
 // A surface's bitmaps take turns: one on screen (the view's), one with the
 // presenter, one the GPU writes the next frame into. With a third, the render
 // thread never waits for the presenter before it hands the GPU the next frame.
-static const int kMaxBitmaps = 3;
+static const int kSyncBitmaps = 3;
+// Unsynchronized overlay frames (swap interval 0) go through a mailbox: one
+// bitmap on screen, one flipped and waiting for the firmware's update point,
+// the newest finished frame waiting for the next vertical blank (replaced by
+// a newer one: superseded, free at once), one being rendered.
+static const int kMaxBitmaps = 4;
 
 /* Overlay bitmaps (B_BITMAP_WILL_OVERLAY) are scanned out by the display: a
  * present flips the view's overlay to the next one. The firmware of the
@@ -140,7 +146,19 @@ struct haiku_egl_surface {
    struct imported_bitmap *pending_slot;
    BBitmap *returned_bitmap; // the presenter's: the one the view gave back
    bigtime_t returned_time; // when it left the screen (0: it was not shown)
-   int swap_interval; // the frame's, for the presenter
+   int swap_interval; // the frame's (render thread)
+   int pending_interval; // pending_bitmap's, for the presenter
+
+   // the mailbox (swap interval 0, overlay bitmaps): the newest finished
+   // frame, which the presenter flips after the next vertical blank, and the
+   // bitmaps the flips replaced, for the render thread; under mailbox_lock
+   pthread_mutex_t mailbox_lock;
+   BBitmap *mailbox_bitmap;
+   struct imported_bitmap *mailbox_slot;
+   BBitmap *mailbox_returned[kMaxBitmaps];
+   bigtime_t mailbox_returned_time[kMaxBitmaps];
+   int mailbox_returned_count;
+   sem_id mailbox_returned_sem; // released for each bitmap returned
 
    // overlay bitmaps
    bool overlay_refused; // not for this size: overlay_width x overlay_height
@@ -155,7 +173,7 @@ struct haiku_egl_surface {
    bigtime_t last_flip; // when the last flip returned
    bigtime_t last_wake; // when the presenter woke for it (synchronized)
    bigtime_t vblank_period;
-   uint32_t flips, missed, starved, late_flips, drops;
+   uint32_t flips, missed, starved, late_flips, drops, superseded;
    // HAIKU_EGL_FPS: frames presented since fps_start (us), printed every 5 s,
    // with the render thread's waits for the presenter and the GPU
    uint32_t fps_frames;
@@ -172,6 +190,7 @@ struct haiku_present {
 
 static void release_import(struct haiku_egl_surface *surface, BBitmap *bitmap);
 static void wait_presented(struct haiku_egl_surface *surface);
+static void put_free_bitmap(struct haiku_egl_surface *surface, BBitmap *bitmap);
 
 /* A signal interrupts a semaphore wait (B_INTERRUPTED): the program's handler
  * runs on whichever thread took it, the presenter or the render thread. Neither
@@ -236,6 +255,8 @@ haiku_create_window_surface(_EGLDisplay *disp, _EGLConfig *conf,
    for (auto &import : wgl_surf->imported)
       import.clone = -1;
    wgl_surf->vblank_period = 16667;
+   pthread_mutex_init(&wgl_surf->mailbox_lock, NULL);
+   wgl_surf->mailbox_returned_sem = -1;
    if (hgl_dpy->hardware && be_app != NULL
        && native_window_shows_overlays(native_window)) {
       // for overlay frames: the screen's size and its retrace semaphore (the
@@ -313,7 +334,14 @@ haiku_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
             ; // the presenter uses the surface until it has returned
          delete_sem(hgl_surf->present_sem);
          delete_sem(hgl_surf->presented_sem);
+         delete_sem(hgl_surf->mailbox_returned_sem);
       }
+      // what the presenter left in the mailbox
+      if (hgl_surf->mailbox_bitmap != NULL)
+         put_free_bitmap(hgl_surf, hgl_surf->mailbox_bitmap);
+      for (int i = 0; i < hgl_surf->mailbox_returned_count; i++)
+         put_free_bitmap(hgl_surf, hgl_surf->mailbox_returned[i]);
+      pthread_mutex_destroy(&hgl_surf->mailbox_lock);
 
       // Unset bitmap to release ownership. Bitmap will be deleted later
       // when destroying framebuffer.
@@ -418,10 +446,21 @@ put_returned_bitmap(struct haiku_egl_surface *surface, BBitmap *bitmap,
    surface->retired_at[surface->retiring_count++] = left;
 }
 
-/* Moves the retiring bitmaps that are off screen to the free ones. */
+/* Moves the retiring bitmaps that are off screen to the free ones; first
+ * takes those the presenter's mailbox flips gave back. */
 static void
 collect_retired(struct haiku_egl_surface *surface)
 {
+   if (surface->mailbox_returned_count > 0) {
+      pthread_mutex_lock(&surface->mailbox_lock);
+      for (int i = 0; i < surface->mailbox_returned_count; i++) {
+         put_returned_bitmap(surface, surface->mailbox_returned[i],
+                             surface->mailbox_returned_time[i]);
+      }
+      surface->mailbox_returned_count = 0;
+      pthread_mutex_unlock(&surface->mailbox_lock);
+   }
+
    const bigtime_t waitedFrom = atomic_get64(&surface->waited_from);
    for (int i = 0; i < surface->retiring_count;) {
       if (surface->retired_at[i] + kRetireGuard <= waitedFrom) {
@@ -541,6 +580,8 @@ static BBitmap *
 take_bitmap(struct haiku_egl_surface *surface, unsigned width, unsigned height)
 {
    const bool overlay = want_overlay(surface, width, height);
+   const int limit = overlay && surface->swap_interval == 0
+      ? kMaxBitmaps : kSyncBitmaps;
    while (true) {
       collect_retired(surface);
       if (surface->free_count > 0) {
@@ -553,13 +594,17 @@ take_bitmap(struct haiku_egl_surface *surface, unsigned width, unsigned height)
          delete_bitmap(surface, bitmap);
          continue;
       }
-      if (surface->bitmap_count < kMaxBitmaps)
+      if (surface->bitmap_count < limit)
          return new_bitmap(surface, width, height, overlay);
 
       const bigtime_t start = system_time();
       if (surface->presenting)
          wait_presented(surface);
-      else if (surface->retiring_count > 0) {
+      else if (surface->retiring_count == 0 && surface->mailbox_returned_sem >= 0) {
+         // the mailbox's next flip gives one back (a frame's time at most)
+         acquire_sem_etc(surface->mailbox_returned_sem, 1, B_RELATIVE_TIMEOUT,
+                         50000);
+      } else if (surface->retiring_count > 0) {
          bigtime_t oldest = surface->retired_at[0];
          for (int i = 1; i < surface->retiring_count; i++)
             oldest = std::min(oldest, surface->retired_at[i]);
@@ -718,6 +763,48 @@ wait_flip_slot(struct haiku_egl_surface *surface, bigtime_t ready)
  * vertical blank with swap interval 1; the bitmap it replaces is returned
  * with the time it left the screen.
  */
+/*
+ * A mailbox frame (swap interval 0): the flip waits for the next vertical
+ * blank (from kRetireGuard after the last flip on, so that the bitmap the last
+ * flip replaced is off screen then), and shows the newest frame finished by
+ * then. One flip per blank: the frames the render thread finishes meanwhile
+ * replace each other in the mailbox (superseded), never scanned out, and the
+ * render thread need not wait for the display.
+ */
+static void
+present_mailbox(struct haiku_egl_surface *surface, BitmapHook *hook)
+{
+   wait_vblank(surface, surface->last_flip + kRetireGuard);
+
+   pthread_mutex_lock(&surface->mailbox_lock);
+   BBitmap *bitmap = surface->mailbox_bitmap;
+   struct imported_bitmap *slot = surface->mailbox_slot;
+   surface->mailbox_bitmap = NULL;
+   pthread_mutex_unlock(&surface->mailbox_lock);
+   if (bitmap == NULL)
+      return;
+
+   haiku_hw_wait_memory(surface->present_screen, slot->handle);
+   BBitmap *old = hook->SetBitmap(bitmap);
+   const bigtime_t now = system_time();
+   bigtime_t left = 0;
+   if (old == bitmap)
+      surface->drops++;
+   else {
+      surface->flips++;
+      surface->last_flip = now;
+      left = is_overlay(old) ? now : 0;
+   }
+
+   if (old != NULL) {
+      pthread_mutex_lock(&surface->mailbox_lock);
+      surface->mailbox_returned[surface->mailbox_returned_count] = old;
+      surface->mailbox_returned_time[surface->mailbox_returned_count++] = left;
+      pthread_mutex_unlock(&surface->mailbox_lock);
+      release_sem(surface->mailbox_returned_sem);
+   }
+}
+
 static status_t
 haiku_presenter(void *data)
 {
@@ -725,6 +812,16 @@ haiku_presenter(void *data)
    BitmapHook *hook = (BitmapHook *)surface->fb->winsysContext;
    while (acquire_sem_uninterrupted(surface->present_sem) == B_OK
           && !surface->quit) {
+      // each release of present_sem is one frame: a mailbox frame, or then
+      // the synchronous pending_bitmap
+      pthread_mutex_lock(&surface->mailbox_lock);
+      const bool mailbox = surface->mailbox_bitmap != NULL;
+      pthread_mutex_unlock(&surface->mailbox_lock);
+      if (mailbox) {
+         present_mailbox(surface, hook);
+         continue;
+      }
+
       BBitmap *bitmap = surface->pending_bitmap;
       haiku_hw_wait_memory(surface->present_screen, surface->pending_slot->handle);
       if (!is_overlay(bitmap)) {
@@ -737,7 +834,7 @@ haiku_presenter(void *data)
       }
 
       const bigtime_t ready = system_time();
-      if (surface->swap_interval > 0)
+      if (surface->pending_interval > 0)
          wait_flip_slot(surface, ready);
       BBitmap *old = hook->SetBitmap(bitmap);
       const bigtime_t now = system_time();
@@ -747,7 +844,7 @@ haiku_presenter(void *data)
          surface->returned_time = 0;
       } else {
          surface->flips++;
-         if (surface->swap_interval > 0
+         if (surface->pending_interval > 0
              && now - surface->last_wake > surface->vblank_period - kRetireGuard)
             surface->late_flips++;
          surface->last_flip = now;
@@ -816,6 +913,7 @@ haiku_present_finish(struct pipe_context *pipe, struct pipe_resource *resource,
    if (slot != NULL && surface->presenter == 0) {
       surface->present_sem = create_sem(0, "egl present");
       surface->presented_sem = create_sem(0, "egl presented");
+      surface->mailbox_returned_sem = create_sem(0, "egl mailbox returned");
       surface->present_screen = pipe->screen;
       surface->presenter = spawn_thread(haiku_presenter, "egl presenter",
                                         B_DISPLAY_PRIORITY, surface);
@@ -825,6 +923,8 @@ haiku_present_finish(struct pipe_context *pipe, struct pipe_resource *resource,
             kill_thread(surface->presenter);
          delete_sem(surface->present_sem);
          delete_sem(surface->presented_sem);
+         delete_sem(surface->mailbox_returned_sem);
+         surface->mailbox_returned_sem = -1;
          surface->presenter = -1;
       }
    }
@@ -844,9 +944,26 @@ haiku_present_finish(struct pipe_context *pipe, struct pipe_resource *resource,
       hand_to_view(surface, hook, bitmap);
       return;
    }
+   if (slot != NULL && is_overlay(bitmap) && surface->swap_interval == 0) {
+      // the mailbox: replaces a frame still waiting for its vertical blank
+      pthread_mutex_lock(&surface->mailbox_lock);
+      BBitmap *superseded = surface->mailbox_bitmap;
+      surface->mailbox_bitmap = bitmap;
+      surface->mailbox_slot = slot;
+      pthread_mutex_unlock(&surface->mailbox_lock);
+      if (superseded != NULL) {
+         // never shown: free at once (the GPU writes it again only in a job
+         // after the one that wrote it)
+         surface->superseded++;
+         put_free_bitmap(surface, superseded);
+      } else
+         release_sem(surface->present_sem);
+      return;
+   }
    if (slot != NULL) {
       surface->pending_bitmap = bitmap;
       surface->pending_slot = slot;
+      surface->pending_interval = surface->swap_interval;
       surface->presenting = true;
       release_sem(surface->present_sem);
       return;
@@ -919,6 +1036,9 @@ haiku_swap_buffers(_EGLDisplay *disp, _EGLSurface *surf)
 
    _mesa_glthread_finish(st->ctx);
 
+   // (take_bitmap() and the present need it)
+   hgl_surf->swap_interval = surf->SwapInterval;
+
    // hardware screens: the GPU copies the frame into a bitmap as part of the
    // frame's own job, before it is flushed
    static const bool separateBlit = getenv("HAIKU_EGL_SEPARATE_BLIT") != NULL;
@@ -943,7 +1063,6 @@ haiku_swap_buffers(_EGLDisplay *disp, _EGLSurface *surf)
    // flush back buffer and swap buffers if double buffering is used
    if (backBuffer != NULL) {
       if (hgl_dpy->hardware) {
-         hgl_surf->swap_interval = surf->SwapInterval;
          if (!presentFirst) {
             args.present = haiku_present_prepare(st->pipe, backBuffer,
                                                  hgl_surf);
@@ -973,15 +1092,17 @@ haiku_swap_buffers(_EGLDisplay *disp, _EGLSurface *surf)
                  hgl_surf->fps_frames * 1e6 / (now - hgl_surf->fps_start),
                  hgl_surf->throttle_wait / 1e3 / hgl_surf->fps_frames,
                  hgl_surf->presenter_wait / 1e3 / hgl_surf->fps_frames);
-         if (hgl_surf->flips + hgl_surf->drops > 0) {
+         if (hgl_surf->flips + hgl_surf->drops + hgl_surf->superseded > 0) {
             // (the presenter's counts: read without its lock, for a report)
             fprintf(stderr, "egl_haiku: overlay: %u flips, %u missed, %u "
-                    "starved, %u late, %u dropped (swap interval %d, "
-                    "vblank %.3f ms)\n", hgl_surf->flips, hgl_surf->missed,
-                    hgl_surf->starved, hgl_surf->late_flips, hgl_surf->drops,
-                    surf->SwapInterval, hgl_surf->vblank_period / 1e3);
+                    "starved, %u late, %u dropped, %u superseded (swap "
+                    "interval %d, vblank %.3f ms)\n", hgl_surf->flips,
+                    hgl_surf->missed, hgl_surf->starved, hgl_surf->late_flips,
+                    hgl_surf->drops, hgl_surf->superseded, surf->SwapInterval,
+                    hgl_surf->vblank_period / 1e3);
             hgl_surf->flips = hgl_surf->missed = hgl_surf->starved = 0;
             hgl_surf->late_flips = hgl_surf->drops = 0;
+            hgl_surf->superseded = 0;
          }
          hgl_surf->fps_frames = 0;
          hgl_surf->fps_start = now;
