@@ -5,6 +5,7 @@ files_libv3d = files(
   'v3d_blit.c',
   'v3d_bufmgr.c',
   'v3d_bufmgr.h',
+  'v3d_clientptr.c',
   'v3d_cl.c',
   'v3d_cl.h',
   'v3d_context.c',

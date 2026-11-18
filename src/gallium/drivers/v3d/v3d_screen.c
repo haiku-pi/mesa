@@ -294,6 +294,7 @@ v3d_init_screen_caps(struct v3d_screen *screen)
         caps->compute = screen->has_csd;
 
         caps->generate_mipmap = v3d_has_feature(screen, DRM_V3D_PARAM_SUPPORTS_TFU);
+        caps->map_client_pointer = screen->has_placed_map;
 
         caps->indep_blend_enable = true;
 
@@ -830,6 +831,10 @@ v3d_screen_create(int fd, const struct pipe_screen_config *config,
         screen->has_perfmon = v3d_has_feature(screen, DRM_V3D_PARAM_SUPPORTS_PERFMON);
         screen->has_cpu_queue = v3d_has_feature(screen, DRM_V3D_PARAM_SUPPORTS_CPU_QUEUE);
         screen->has_multisync = v3d_has_feature(screen, DRM_V3D_PARAM_SUPPORTS_MULTISYNC_EXT);
+#if DETECT_OS_HAIKU && !USE_V3D_SIMULATOR
+        screen->has_placed_map =
+                v3d_has_feature(screen, DRM_V3D_PARAM_HAIKU_MMAP_BO_PLACED);
+#endif
 
         v3d_fence_screen_init(screen);
 

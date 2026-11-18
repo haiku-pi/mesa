@@ -26,6 +26,7 @@
 #define V3D_RESOURCE_H
 
 #include "v3d_screen.h"
+#include "util/list.h"
 #include "util/u_transfer.h"
 
 #include "broadcom/common/v3d_tiling.h"
@@ -33,6 +34,8 @@
 struct v3d_transfer {
         struct pipe_transfer base;
         void *map;
+        /** The BO a client-pointer map of this transfer is open on. */
+        struct v3d_bo *clientptr_bo;
 };
 
 struct v3d_resource_slice {
@@ -128,5 +131,23 @@ void v3d_update_shadow_texture(struct pipe_context *pctx,
                                struct pipe_sampler_view *view);
 uint32_t v3d_layer_offset(struct pipe_resource *prsc, uint32_t level,
                           uint32_t layer);
+
+/**
+ * GL_MESA_map_buffer_client_pointer: the client-pointer ranges of a GL share
+ * group. Resources created with PIPE_RESOURCE_FLAG_MAP_CLIENT_POINTER, and
+ * the BOs placed into a range of it, hold a reference.
+ */
+struct v3d_clientptr_heap {
+        struct pipe_clientptr_heap base;
+        mtx_t lock;
+        /** BOs whose mapping is a range of this heap (v3d_bo::clientptr_link). */
+        struct list_head placed_bos;
+        /** Ranges no BO uses any more, for clientptr_range_reclaim. */
+        struct list_head free_ranges;
+};
+
+void v3d_clientptr_screen_init(struct pipe_screen *pscreen);
+void v3d_clientptr_context_init(struct pipe_context *pctx);
+void v3d_clientptr_release_bo(struct v3d_bo *bo);
 
 #endif /* V3D_RESOURCE_H */

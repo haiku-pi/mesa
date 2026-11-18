@@ -25,12 +25,25 @@
 #define V3D_BUFMGR_H
 
 #include <stdint.h>
+#include "util/detect_os.h"
 #include "util/u_hash_table.h"
 #include "util/u_inlines.h"
 #include "util/list.h"
 #include "v3d_screen.h"
 
 struct v3d_context;
+struct v3d_clientptr_heap;
+
+#if DETECT_OS_HAIKU
+/* Haiku extensions of the v3d uAPI (headers/private/drivers/drm/v3d_drm.h
+ * in Haiku's tree): with this flag, DRM_IOCTL_V3D_MMAP_BO maps the BO at the
+ * address passed in "offset", replacing whatever the calling team had mapped
+ * there (GL_MESA_map_buffer_client_pointer), instead of at an address of the
+ * kernel's choice. The parameter tells whether the kernel can.
+ */
+#define DRM_V3D_HAIKU_MMAP_BO_PLACED            (1u << 31)
+#define DRM_V3D_PARAM_HAIKU_MMAP_BO_PLACED      0x1000
+#endif
 
 struct v3d_bo {
         struct pipe_reference reference;
@@ -54,6 +67,18 @@ struct v3d_bo {
          * it's safe to reuse it in the BO cache).
          */
         bool private;
+
+        /**
+         * GL_MESA_map_buffer_client_pointer: while set, map is a range the
+         * client gave us (glAddClientPointerRangeMESA) that the BO is mapped
+         * into, and the BO is on that heap's list of placed BOs. The range
+         * goes back to the heap when the BO dies or the client asks for all
+         * of its ranges.
+         */
+        struct v3d_clientptr_heap *clientptr_heap;
+        struct list_head clientptr_link;
+        /** Client-pointer maps open on the BO. */
+        uint32_t clientptr_maps;
 };
 
 struct v3d_bo *v3d_bo_alloc(struct v3d_screen *screen, uint32_t size,
@@ -106,6 +131,12 @@ v3d_bo_map(struct v3d_bo *bo);
 
 void *
 v3d_bo_map_unsynchronized(struct v3d_bo *bo);
+
+bool
+v3d_bo_map_placed(struct v3d_bo *bo, void *address);
+
+bool
+v3d_bo_unmap_placed(struct v3d_bo *bo);
 
 bool
 v3d_bo_wait(struct v3d_bo *bo, uint64_t timeout_ns, const char *reason);

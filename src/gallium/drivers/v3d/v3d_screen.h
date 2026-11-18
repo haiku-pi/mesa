@@ -88,6 +88,8 @@ struct v3d_screen {
         bool nonmsaa_texture_size_limit;
         bool has_cpu_queue;
         bool has_multisync;
+        /** The kernel maps a BO at an address we choose (Haiku). */
+        bool has_placed_map;
 
         float heap_memory_percent;
 

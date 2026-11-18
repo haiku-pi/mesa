@@ -130,6 +130,11 @@ v3d_resource_transfer_unmap(struct pipe_context *pctx,
         struct v3d_context *v3d = v3d_context(pctx);
         struct v3d_transfer *trans = v3d_transfer(ptrans);
 
+        if (trans->clientptr_bo) {
+                /* The frontend ends client-pointer maps first. */
+                pctx->transfer_unmap_clientptr_range(pctx, ptrans);
+        }
+
         if (trans->map) {
                 struct v3d_resource *rsc = v3d_resource(ptrans->resource);
                 struct v3d_resource_slice *slice = &rsc->slices[ptrans->level];
@@ -307,6 +312,20 @@ v3d_resource_transfer_map(struct pipe_context *pctx,
          * need to do syncing stuff here yet.
          */
 
+        if (usage & PIPE_MAP_CLIENT_POINTER) {
+                /* GL_MESA_map_buffer_client_pointer: the pointer comes from
+                 * transfer_map_clientptr_range(), which maps the BO into the
+                 * client's range if it is not there yet.
+                 */
+                assert(prsc->target == PIPE_BUFFER && prsc->clientptr_heap);
+                if (!(usage & PIPE_MAP_UNSYNCHRONIZED))
+                        v3d_bo_wait(rsc->bo, OS_TIMEOUT_INFINITE, "bo map");
+                ptrans->stride = rsc->slices[level].stride;
+                ptrans->layer_stride = rsc->cube_map_stride;
+                *pptrans = ptrans;
+                return PIPE_TRANSFER_CLIENT_POINTER;
+        }
+
         if (usage & PIPE_MAP_UNSYNCHRONIZED)
                 buf = v3d_bo_map_unsynchronized(rsc->bo);
         else
@@ -424,6 +443,7 @@ v3d_resource_destroy(struct pipe_screen *pscreen,
                 renderonly_scanout_destroy(rsc->scanout, screen->ro);
 
         v3d_bo_unreference(&rsc->bo);
+        pipe_clientptr_heap_reference(pscreen, &prsc->clientptr_heap, NULL);
         free(rsc);
 }
 
@@ -793,6 +813,13 @@ v3d_resource_setup(struct pipe_screen *pscreen,
 
         pipe_reference_init(&prsc->reference, 1);
         prsc->screen = pscreen;
+
+        prsc->clientptr_heap = NULL;
+        if (prsc->flags & PIPE_RESOURCE_FLAG_MAP_CLIENT_POINTER) {
+                assert(prsc->target == PIPE_BUFFER && tmpl->clientptr_heap);
+                pipe_clientptr_heap_reference(pscreen, &prsc->clientptr_heap,
+                                              tmpl->clientptr_heap);
+        }
 
         rsc->cpp = util_format_get_blocksize(prsc->format);
         rsc->serial_id++;
@@ -1200,6 +1227,7 @@ v3d_resource_screen_init(struct pipe_screen *pscreen)
         pscreen->transfer_helper = u_transfer_helper_create(&transfer_vtbl,
                                                             U_TRANSFER_HELPER_SEPARATE_Z32S8 |
                                                             U_TRANSFER_HELPER_MSAA_MAP);
+        v3d_clientptr_screen_init(pscreen);
 }
 
 void
@@ -1216,4 +1244,5 @@ v3d_resource_context_init(struct pipe_context *pctx)
         pctx->blit = v3d_blit;
         pctx->generate_mipmap = v3d_generate_mipmap;
         pctx->flush_resource = v3d_flush_resource;
+        v3d_clientptr_context_init(pctx);
 }

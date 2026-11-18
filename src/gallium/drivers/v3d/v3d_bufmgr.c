@@ -278,6 +278,12 @@ v3d_bo_last_unreference_locked_timed(struct v3d_bo *bo, time_t time)
         struct v3d_bo_cache *cache = &screen->bo_cache;
         uint32_t page_index = bo->size / 4096 - 1;
 
+        /* A BO mapped into a client's range gives the range back first: a
+         * BO in the cache may be reused for anything.
+         */
+        if (bo->clientptr_heap)
+                v3d_clientptr_release_bo(bo);
+
         if (!bo->private) {
                 v3d_bo_free(bo);
                 return;
@@ -560,6 +566,58 @@ v3d_bo_map(struct v3d_bo *bo)
         VG(VALGRIND_MAKE_MEM_DEFINED(map, bo->size));
 
         return map;
+}
+
+/**
+ * Maps the BO at \p address, a range of the BO's size the client gave us
+ * (GL_MESA_map_buffer_client_pointer), replacing the client's memory there in
+ * one step: no moment leaves a hole in the range another thread could map
+ * into. The BO's mapping is the range from now on; a mapping it had before
+ * goes away.
+ */
+bool
+v3d_bo_map_placed(struct v3d_bo *bo, void *address)
+{
+#if DETECT_OS_HAIKU
+        struct drm_v3d_mmap_bo map = {
+                .handle = bo->handle,
+                .flags = DRM_V3D_HAIKU_MMAP_BO_PLACED,
+                .offset = (uintptr_t)address,
+        };
+        if (v3d_ioctl(bo->screen->fd, DRM_IOCTL_V3D_MMAP_BO, &map) != 0) {
+                mesa_loge("placed map of bo %d at %p failed: %s", bo->handle,
+                          address, strerror(errno));
+                return false;
+        }
+        assert(map.offset == (uintptr_t)address);
+
+        void *old_map = bo->map;
+        bo->map = address;
+        if (old_map)
+                munmap(old_map, bo->size);
+        return true;
+#else
+        return false;
+#endif
+}
+
+/**
+ * Puts plain zeroed memory back over the BO's placed mapping, the memory the
+ * client had there before v3d_bo_map_placed() (again in one step), so that the
+ * range can go back to the client. The BO is left unmapped.
+ */
+bool
+v3d_bo_unmap_placed(struct v3d_bo *bo)
+{
+        void *map = mmap(bo->map, bo->size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (map == MAP_FAILED) {
+                mesa_loge("cannot put memory back over placed bo %d at %p: %s",
+                          bo->handle, bo->map, strerror(errno));
+                return false;
+        }
+        bo->map = NULL;
+        return true;
 }
 
 void
