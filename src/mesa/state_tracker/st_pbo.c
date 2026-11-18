@@ -677,6 +677,10 @@ st_init_pbo_helpers(struct st_context *st)
    /* Rasterizer state */
    memset(&st->pbo.raster, 0, sizeof(struct pipe_rasterizer_state));
    st->pbo.raster.half_pixel_center = 1;
+   /* the quads lie inside the planes: a zeroed state asked for depth
+    * clamping, which drivers that emulate it would do for nothing */
+   st->pbo.raster.depth_clip_near = 1;
+   st->pbo.raster.depth_clip_far = 1;
 
    const char *pbo = debug_get_option("MESA_COMPUTE_PBO", NULL);
    if (pbo) {
