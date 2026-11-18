@@ -2407,6 +2407,11 @@ intrinsic("load_fb_layers_v3d", dest_comp=1, flags=[CAN_ELIMINATE, CAN_REORDER])
 # V3D-specific intrinsic to load W coordinate from the fragment shader payload
 intrinsic("load_fep_w_v3d", dest_comp=1, flags=[CAN_ELIMINATE, CAN_REORDER])
 
+# The polygon offset of the rasterizer state for V3D 4.x's emulated depth
+# clamping: units (in depth units, or in units of the depth's ULP for a float
+# depth buffer), factor, clamp.
+intrinsic("load_depth_offset_v3d", dest_comp=3, flags=[CAN_ELIMINATE, CAN_REORDER])
+
 # Active invocation index within the subgroup.
 # Equivalent to popcount(ballot(true) & ((1 << subgroup_invocation) - 1))
 intrinsic("load_active_subgroup_invocation_agx", dest_comp=1, flags=[CAN_ELIMINATE])

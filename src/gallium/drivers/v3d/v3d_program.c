@@ -627,6 +627,15 @@ v3d_update_compiled_fs(struct v3d_context *v3d, uint8_t prim_mode)
         key->is_points = (prim_mode == MESA_PRIM_POINTS);
         key->is_lines = (prim_mode >= MESA_PRIM_LINES &&
                          prim_mode <= MESA_PRIM_LINE_STRIP);
+        /* The shader's depth gets the polygon offset the hardware would
+         * give its own (as v3dx_emit.c enables it).
+         */
+        key->depth_offset = key->depth_clamp &&
+                v3d->rasterizer->base.offset_tri &&
+                !key->is_points && !key->is_lines;
+        key->depth_offset_float = key->depth_offset &&
+                v3d->framebuffer.zsbuf.texture &&
+                util_format_get_depth_bits(v3d->framebuffer.zsbuf.format) == 32;
         key->line_smoothing = (key->is_lines &&
                                v3d_line_smoothing_enabled(v3d));
         key->has_gs = v3d->prog.bind_gs != NULL;

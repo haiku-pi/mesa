@@ -21,6 +21,9 @@
  * IN THE SOFTWARE.
  */
 
+#include <math.h>
+
+#include "util/format/u_format.h"
 #include "util/u_pack_color.h"
 #include "util/u_upload_mgr.h"
 
@@ -415,6 +418,26 @@ v3d_write_uniforms(struct v3d_context *v3d, struct v3d_job *job,
                         cl_aligned_f(&uniforms, v3d->blend_color.f.color[3]);
                         break;
 
+                case QUNIFORM_DEPTH_OFFSET_UNITS: {
+                        /* in depth units; a float depth buffer's ULP is
+                         * applied in the shader
+                         */
+                        enum pipe_format zs = v3d->framebuffer.zsbuf.texture ?
+                                v3d->framebuffer.zsbuf.format : PIPE_FORMAT_NONE;
+                        unsigned bits = util_format_get_depth_bits(zs);
+                        float units = v3d->rasterizer->base.offset_units;
+                        if (bits == 16 || bits == 24)
+                                units = ldexpf(units, -(int)bits);
+                        cl_aligned_f(&uniforms, units);
+                        break;
+                }
+                case QUNIFORM_DEPTH_OFFSET_FACTOR:
+                        cl_aligned_f(&uniforms, v3d->rasterizer->base.offset_scale);
+                        break;
+                case QUNIFORM_DEPTH_OFFSET_CLAMP:
+                        cl_aligned_f(&uniforms, v3d->rasterizer->base.offset_clamp);
+                        break;
+
                 default:
                         UNREACHABLE("Unknown QUNIFORM");
 
@@ -510,6 +533,12 @@ v3d_set_shader_uniform_dirty_flags(struct v3d_compiled_shader *shader)
                 case QUNIFORM_BLEND_CONSTANT_B:
                 case QUNIFORM_BLEND_CONSTANT_A:
                         dirty |= V3D_DIRTY_BLEND_COLOR;
+                        break;
+
+                case QUNIFORM_DEPTH_OFFSET_UNITS:
+                case QUNIFORM_DEPTH_OFFSET_FACTOR:
+                case QUNIFORM_DEPTH_OFFSET_CLAMP:
+                        dirty |= V3D_DIRTY_RASTERIZER | V3D_DIRTY_FRAMEBUFFER;
                         break;
 
                 default:

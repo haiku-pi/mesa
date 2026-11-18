@@ -1280,7 +1280,7 @@ static void
 v3d_nir_lower_fs_early(struct v3d_compile *c)
 {
         if (c->fs_key->depth_clamp)
-                NIR_PASS(_, c->s, v3d_nir_lower_depth_clamp_fs);
+                NIR_PASS(_, c->s, v3d_nir_lower_depth_clamp_fs, c);
 
         if (c->fs_key->line_smoothing) {
                 NIR_PASS(_, c->s, v3d_nir_lower_line_smooth);

@@ -275,6 +275,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_num_vertices:
    case nir_intrinsic_load_fb_layers_v3d:
    case nir_intrinsic_load_fep_w_v3d:
+   case nir_intrinsic_load_depth_offset_v3d:
    case nir_intrinsic_load_tcs_num_patches_amd:
    case nir_intrinsic_load_tcs_tess_levels_to_tes_amd:
    case nir_intrinsic_load_tcs_primitive_mode_amd:

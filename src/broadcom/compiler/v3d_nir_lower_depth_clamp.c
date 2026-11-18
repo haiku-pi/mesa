@@ -20,6 +20,11 @@
  * where the clipper cut the primitive. Reads of gl_FragCoord.z see the
  * unclamped depth, as the hardware's Z would be.
  *
+ * The polygon offset, which the hardware applies to its own Z only, is added
+ * the same way: factor × the depth's largest screen-space slope + units × the
+ * depth buffer's resolution (for a float depth buffer, of the depth's
+ * exponent), then limited by the clamp.
+ *
  * Writing the depth from the shader turns off early Z tests while depth
  * clamping is on. A fragment shader that already uses every input slot, or
  * forces early fragment tests, is left alone; its last geometry stage then
@@ -69,8 +74,32 @@ clamp_to_depth_range(nir_builder *b, nir_def *depth)
                         nir_fadd(b, offset, half_range));
 }
 
+static nir_def *
+polygon_offset(nir_builder *b, nir_def *depth, bool float_depth)
+{
+        nir_def *params = nir_load_depth_offset_v3d(b, 32);
+        nir_def *units = nir_channel(b, params, 0);
+        nir_def *factor = nir_channel(b, params, 1);
+        nir_def *limit = nir_channel(b, params, 2);
+
+        if (float_depth) {
+                /* the resolution at the depth's exponent: 2^(e - 23) */
+                nir_def *e = nir_ffloor(b, nir_flog2(b, nir_fabs(b, depth)));
+                units = nir_fmul(b, units,
+                                 nir_fexp2(b, nir_fadd_imm(b, e, -23.0f)));
+        }
+        nir_def *slope = nir_fmax(b, nir_fabs(b, nir_ddx(b, depth)),
+                                  nir_fabs(b, nir_ddy(b, depth)));
+        nir_def *offset = nir_ffma(b, factor, slope, units);
+        offset = nir_bcsel(b, nir_fgt_imm(b, limit, 0.0f),
+                           nir_fmin(b, offset, limit),
+                           nir_bcsel(b, nir_flt_imm(b, limit, 0.0f),
+                                     nir_fmax(b, offset, limit), offset));
+        return nir_fadd(b, depth, offset);
+}
+
 bool
-v3d_nir_lower_depth_clamp_fs(nir_shader *s)
+v3d_nir_lower_depth_clamp_fs(nir_shader *s, struct v3d_compile *c)
 {
         assert(s->info.stage == MESA_SHADER_FRAGMENT);
 
@@ -107,6 +136,8 @@ v3d_nir_lower_depth_clamp_fs(nir_shader *s)
         z = nir_fdiv(&b, z, nir_load_fep_w_v3d(&b, 32));
         nir_def *depth = nir_ffma(&b, z, nir_load_viewport_z_scale(&b),
                                   nir_load_viewport_z_offset(&b));
+        if (c->fs_key->depth_offset)
+                depth = polygon_offset(&b, depth, c->fs_key->depth_offset_float);
 
         nir_foreach_block(block, impl) {
                 nir_foreach_instr_safe(instr, block) {

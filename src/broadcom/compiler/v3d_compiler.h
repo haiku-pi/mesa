@@ -366,6 +366,14 @@ enum quniform_contents {
         QUNIFORM_BLEND_CONSTANT_G,
         QUNIFORM_BLEND_CONSTANT_B,
         QUNIFORM_BLEND_CONSTANT_A,
+
+        /**
+         * Polygon offset for emulated depth clamping (V3D 4.x): units in
+         * depth units (or ULPs of a float depth), factor, clamp.
+         */
+        QUNIFORM_DEPTH_OFFSET_UNITS,
+        QUNIFORM_DEPTH_OFFSET_FACTOR,
+        QUNIFORM_DEPTH_OFFSET_CLAMP,
 };
 
 static inline uint32_t v3d_unit_data_create(uint32_t unit, uint32_t value)
@@ -450,8 +458,12 @@ struct v3d_fs_key {
 
         uint8_t ucp_enables;
 
-        /* Emulate depth clamping (V3D 4.x: v3d_nir_lower_depth_clamp.c) */
+        /* Emulate depth clamping (V3D 4.x: v3d_nir_lower_depth_clamp.c),
+         * with the polygon offset (of a float depth buffer: in its ULPs).
+         */
         bool depth_clamp;
+        bool depth_offset;
+        bool depth_offset_float;
 
         /* Color format information per render target. Only set when logic
          * operations are enabled, when fbfetch is in use or when falling back
@@ -1273,7 +1285,7 @@ bool vir_opt_alu(struct v3d_compile *c);
 bool vir_opt_redundant_setnnmode(struct v3d_compile *c);
 bool v3d_nir_lower_io(nir_shader *s, struct v3d_compile *c);
 bool v3d_nir_lower_line_smooth(nir_shader *shader);
-bool v3d_nir_lower_depth_clamp_fs(nir_shader *s);
+bool v3d_nir_lower_depth_clamp_fs(nir_shader *s, struct v3d_compile *c);
 bool v3d_nir_lower_logic_ops(nir_shader *s, struct v3d_compile *c);
 bool v3d_nir_lower_scratch(nir_shader *s);
 bool v3d_nir_lower_txf_ms(nir_shader *s);
