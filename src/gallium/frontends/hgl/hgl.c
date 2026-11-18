@@ -326,6 +326,10 @@ hgl_create_context(struct hgl_display *display, struct st_visual* visual,
 	struct st_context_attribs attribs;
 	memset(&attribs, 0, sizeof(attribs));
 	attribs.options.force_glsl_extensions_warn = false;
+	// Mesa's DRI default (driinfo_gallium.h): compressed formats the driver
+	// cannot sample (RGTC on the V3D) are decompressed at upload. OpenGL 3.0
+	// requires RGTC, so without it no context goes beyond 2.1.
+	attribs.options.allow_compressed_fallback = true;
 	attribs.profile = api;
 	attribs.visual = *visual;
 	hgl_choose_depth_stencil_format(display->fscreen->screen, &attribs.visual);
