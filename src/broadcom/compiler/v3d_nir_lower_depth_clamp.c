@@ -90,7 +90,8 @@ polygon_offset(nir_builder *b, nir_def *depth, bool float_depth)
         }
         nir_def *slope = nir_fmax(b, nir_fabs(b, nir_ddx(b, depth)),
                                   nir_fabs(b, nir_ddy(b, depth)));
-        nir_def *offset = nir_ffma(b, factor, slope, units);
+        /* (no ffma: V3D has none, and the passes that avoid it ran) */
+        nir_def *offset = nir_fadd(b, nir_fmul(b, factor, slope), units);
         offset = nir_bcsel(b, nir_fgt_imm(b, limit, 0.0f),
                            nir_fmin(b, offset, limit),
                            nir_bcsel(b, nir_flt_imm(b, limit, 0.0f),
@@ -133,8 +134,8 @@ v3d_nir_lower_depth_clamp_fs(nir_shader *s, struct v3d_compile *c)
                                     .dest_type = nir_type_float32,
                                     .io_semantics.location = V3D_DEPTH_CLAMP_SLOT,
                                     .io_semantics.num_slots = 1);
-        z = nir_fdiv(&b, z, nir_load_fep_w_v3d(&b, 32));
-        nir_def *depth = nir_ffma(&b, z, nir_load_viewport_z_scale(&b),
+        z = nir_fmul(&b, z, nir_frcp(&b, nir_load_fep_w_v3d(&b, 32)));
+        nir_def *depth = nir_fadd(&b, nir_fmul(&b, z, nir_load_viewport_z_scale(&b)),
                                   nir_load_viewport_z_offset(&b));
         if (c->fs_key->depth_offset)
                 depth = polygon_offset(&b, depth, c->fs_key->depth_offset_float);
