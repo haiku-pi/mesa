@@ -501,17 +501,36 @@ v3d_nir_emit_ff_vpm_outputs(struct v3d_compile *c, nir_builder *b,
                 c->s->info.stage == MESA_SHADER_GEOMETRY ?
                         nir_load_var(b, state->gs.output_offset_var) : NULL;
 
+        nir_def *ff_pos[4];
         for (int i = 0; i < 4; i++) {
                 if (!state->pos[i])
                         state->pos[i] = nir_undef(b, 1, 32);
+                ff_pos[i] = state->pos[i];
         }
 
-        nir_def *rcp_wc = nir_frcp(b, state->pos[3]);
+        bool depth_clamp =
+                c->s->info.stage == MESA_SHADER_VERTEX ? c->vs_key->depth_clamp :
+                                                         c->gs_key->depth_clamp;
+        if (depth_clamp) {
+                /* Emulated depth clamping (v3d_nir_lower_depth_clamp.c): the
+                 * clip-space Z goes to the fragment shader, and the hardware
+                 * gets a Z that no near or far plane clips.
+                 */
+                int slot = v3d_varying_slot_vpm_offset(c, V3D_DEPTH_CLAMP_SLOT, 0);
+                if (slot != -1) {
+                        v3d_nir_store_output(b, state->varyings_vpm_offset + slot,
+                                             offset_reg, ff_pos[2]);
+                        BITSET_SET(state->varyings_stored, slot);
+                }
+                ff_pos[2] = nir_imm_float(b, 0.0f);
+        }
+
+        nir_def *rcp_wc = nir_frcp(b, ff_pos[3]);
 
         if (state->pos_vpm_offset != -1) {
                 for (int i = 0; i < 4; i++) {
                         v3d_nir_store_output(b, state->pos_vpm_offset + i,
-                                             offset_reg, state->pos[i]);
+                                             offset_reg, ff_pos[i]);
                 }
         }
 
@@ -519,7 +538,7 @@ v3d_nir_emit_ff_vpm_outputs(struct v3d_compile *c, nir_builder *b,
                 for (int i = 0; i < 2; i++) {
                         nir_def *pos;
                         nir_def *scale;
-                        pos = state->pos[i];
+                        pos = ff_pos[i];
                         if (i == 0)
                                 scale = nir_load_viewport_x_scale(b);
                         else
@@ -548,7 +567,7 @@ v3d_nir_emit_ff_vpm_outputs(struct v3d_compile *c, nir_builder *b,
         }
 
         if (state->zs_vpm_offset != -1) {
-                nir_def *z = state->pos[2];
+                nir_def *z = ff_pos[2];
                 z = nir_fmul(b, z, nir_load_viewport_z_scale(b));
                 z = nir_fmul(b, z, rcp_wc);
                 z = nir_fadd(b, z, nir_load_viewport_z_offset(b));

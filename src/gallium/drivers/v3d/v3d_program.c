@@ -618,6 +618,12 @@ v3d_update_compiled_fs(struct v3d_context *v3d, uint8_t prim_mode)
         memset(key, 0, sizeof(*key));
         v3d_setup_shared_key(v3d, &key->base, &v3d->tex[MESA_SHADER_FRAGMENT]);
         key->ucp_enables = v3d->rasterizer->base.clip_plane_enable;
+        /* V3D 7.1 turns off depth clipping and clamps in hardware
+         * (v3dx_emit.c); V3D 4.x has the shaders do it.
+         */
+        key->depth_clamp = v3d->screen->devinfo.ver < 71 &&
+                (!v3d->rasterizer->base.depth_clip_near ||
+                 !v3d->rasterizer->base.depth_clip_far);
         key->is_points = (prim_mode == MESA_PRIM_POINTS);
         key->is_lines = (prim_mode >= MESA_PRIM_LINES &&
                          prim_mode <= MESA_PRIM_LINE_STRIP);
@@ -768,6 +774,23 @@ v3d_update_compiled_fs(struct v3d_context *v3d, uint8_t prim_mode)
         }
 }
 
+/* Whether the fragment shader emulates depth clamping, so that the last
+ * geometry stage must send it the clip-space Z (v3d_nir_lower_depth_clamp.c).
+ */
+static bool
+v3d_fs_reads_clip_z(const struct v3d_compiled_shader *fs)
+{
+        const struct v3d_varying_slot slot =
+                v3d_slot_from_slot_and_component(V3D_DEPTH_CLAMP_SLOT, 0);
+
+        for (int i = 0; i < fs->prog_data.fs->num_inputs; i++) {
+                if (fs->prog_data.fs->input_slots[i].slot_and_component ==
+                    slot.slot_and_component)
+                        return true;
+        }
+        return false;
+}
+
 static void
 v3d_update_compiled_gs(struct v3d_context *v3d, uint8_t prim_mode)
 {
@@ -800,6 +823,7 @@ v3d_update_compiled_gs(struct v3d_context *v3d, uint8_t prim_mode)
         key->per_vertex_point_size =
                 (prim_mode == MESA_PRIM_POINTS &&
                  v3d->rasterizer->base.point_size_per_vertex);
+        key->depth_clamp = v3d_fs_reads_clip_z(v3d->prog.fs);
 
         struct v3d_uncompiled_shader *uncompiled = v3d->prog.bind_gs;
         struct v3d_compiled_shader *gs =
@@ -870,6 +894,7 @@ v3d_update_compiled_vs(struct v3d_context *v3d, uint8_t prim_mode)
                           sizeof(v3d->prog.fs->prog_data.fs->input_slots));
             memcpy(key->used_outputs, v3d->prog.fs->prog_data.fs->input_slots,
                    sizeof(key->used_outputs));
+            key->depth_clamp = v3d_fs_reads_clip_z(v3d->prog.fs);
         } else {
             key->num_used_outputs = v3d->prog.gs->prog_data.gs->num_inputs;
             STATIC_ASSERT(sizeof(key->used_outputs) ==

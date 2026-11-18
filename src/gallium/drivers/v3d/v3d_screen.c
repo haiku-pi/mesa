@@ -265,6 +265,11 @@ v3d_init_screen_caps(struct v3d_screen *screen)
         caps->conditional_render = true;
         caps->conditional_render_inverted = true;
         caps->cube_map_array = true;
+        /* The TMU always filters across cube map faces (as OpenGL ES 3 and
+         * Vulkan require) and has no way to turn it off: disabling
+         * GL_TEXTURE_CUBE_MAP_SEAMLESS has no effect.
+         */
+        caps->seamless_cube_map = true;
         caps->texture_barrier = true;
         caps->polygon_offset_clamp = true;
         caps->texture_query_lod = true;
@@ -369,7 +374,8 @@ v3d_init_screen_caps(struct v3d_screen *screen)
         caps->native_fence_fd = true;
 
         caps->clip_planes = 0;
-        caps->depth_clip_disable = screen->devinfo.ver >= 71;
+        /* V3D 4.x emulates it in the shaders (v3d_nir_lower_depth_clamp.c) */
+        caps->depth_clip_disable = true;
         caps->clip_halfz = screen->devinfo.ver >= 71;
 
         caps->min_line_width =

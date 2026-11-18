@@ -388,6 +388,12 @@ struct v3d_varying_slot {
         uint8_t slot_and_component;
 };
 
+/* The varying that carries the clip-space Z to the fragment shader when depth
+ * clamping is emulated (v3d_nir_lower_depth_clamp.c). OpenGL programs use at
+ * most V3D_MAX_FS_INPUTS / 4 generic varyings, from VARYING_SLOT_VAR0.
+ */
+#define V3D_DEPTH_CLAMP_SLOT VARYING_SLOT_VAR30
+
 static inline struct v3d_varying_slot
 v3d_slot_from_slot_and_component(uint8_t slot, uint8_t component)
 {
@@ -444,6 +450,9 @@ struct v3d_fs_key {
 
         uint8_t ucp_enables;
 
+        /* Emulate depth clamping (V3D 4.x: v3d_nir_lower_depth_clamp.c) */
+        bool depth_clamp;
+
         /* Color format information per render target. Only set when logic
          * operations are enabled, when fbfetch is in use or when falling back
          * to software blend.
@@ -490,6 +499,10 @@ struct v3d_gs_key {
 
         bool is_coord;
         bool per_vertex_point_size;
+        /* Depth clamping emulated (V3D 4.x): the fragment shader reads the
+         * clip-space Z at V3D_DEPTH_CLAMP_SLOT.
+         */
+        bool depth_clamp;
 };
 
 struct v3d_vs_key {
@@ -507,6 +520,8 @@ struct v3d_vs_key {
         bool is_coord;
         bool per_vertex_point_size;
         bool clamp_color;
+        /* As in v3d_gs_key, when this is the last geometry stage */
+        bool depth_clamp;
 };
 
 /** A basic block of VIR instructions. */
@@ -1258,6 +1273,7 @@ bool vir_opt_alu(struct v3d_compile *c);
 bool vir_opt_redundant_setnnmode(struct v3d_compile *c);
 bool v3d_nir_lower_io(nir_shader *s, struct v3d_compile *c);
 bool v3d_nir_lower_line_smooth(nir_shader *shader);
+bool v3d_nir_lower_depth_clamp_fs(nir_shader *s);
 bool v3d_nir_lower_logic_ops(nir_shader *s, struct v3d_compile *c);
 bool v3d_nir_lower_scratch(nir_shader *s);
 bool v3d_nir_lower_txf_ms(nir_shader *s);
