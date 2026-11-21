@@ -26,7 +26,6 @@
 #include "util/perf/cpu_trace.h"
 #include "util/u_surface.h"
 #include "util/u_blitter.h"
-#include "util/bitscan.h"
 #include "compiler/nir/nir_builder.h"
 #include "v3d_context.h"
 #include "broadcom/common/v3d_tiling.h"
@@ -251,18 +250,6 @@ v3d_generate_mipmap(struct pipe_context *pctx,
 
         /* We don't support 3D */
         if (prsc->target == PIPE_TEXTURE_3D)
-                return false;
-
-        /* The TFU takes the padding (OPAD) of the first level it writes
-         * only; the tiling of the levels after it is inferred.  That
-         * inference matches v3d_setup_slices(), and so the layout the TMU
-         * samples, only for power-of-two base sizes.  For other sizes the
-         * small UBLINEAR/LINEARTILE levels come out laid out differently,
-         * and distant objects with such textures are drawn scrambled.
-         * Leave those to the render-based fallback (util_gen_mipmap).
-         */
-        if (!util_is_power_of_two_or_zero(prsc->width0) ||
-            !util_is_power_of_two_or_zero(prsc->height0))
                 return false;
 
         struct v3d_context *v3d = v3d_context(pctx);
